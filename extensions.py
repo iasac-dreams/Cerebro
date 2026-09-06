@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from typing import Any
 import requests
@@ -15,6 +16,8 @@ except ImportError:
     bigquery = None
 from google.protobuf import timestamp_pb2
 import config
+
+logger = logging.getLogger(__name__)
 
 _db: firestore.Client | None = None
 _tasks: tasks_v2.CloudTasksClient | None = None
@@ -36,10 +39,14 @@ def tasks_client() -> tasks_v2.CloudTasksClient:
     return _tasks
 
 
-def bq_client() -> bigquery.Client:
+def bq_client() -> bigquery.Client | None:
     global _bq
-    if _bq is None:
-        _bq = bigquery.Client(project=config.PROJECT_ID or None, location=config.REGION)
+    if _bq is None and bigquery is not None:
+        try:
+            _bq = bigquery.Client(project=config.PROJECT_ID or None, location=config.REGION)
+        except Exception as e:
+            logger.warning("Could not initialize BigQuery client: %s", e)
+            return None
     return _bq
 
 

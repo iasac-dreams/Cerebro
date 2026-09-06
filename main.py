@@ -157,7 +157,11 @@ def tasks_client() -> tasks_v2.CloudTasksClient:
 def bq_client() -> Any:
     global _bq
     if _bq is None and bigquery is not None:
-        _bq = bigquery.Client(project=PROJECT_ID or None, location=REGION)
+        try:
+            _bq = bigquery.Client(project=PROJECT_ID or None, location=REGION)
+        except Exception as e:
+            logger.warning("Could not initialize BigQuery client: %s", e)
+            return None
     return _bq
 
 
