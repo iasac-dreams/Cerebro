@@ -105,7 +105,13 @@ def handle_zendesk_task(body: dict):
     metadata = sunshine_payload.get("metadata") if isinstance(sunshine_payload.get("metadata"), dict) else {}
     if not metadata and isinstance(message.get("metadata"), dict):
         metadata = message.get("metadata") or {}
-    origin_ticket_id = metadata.get("ticket_id") or metadata.get("ticketId")
+    origin_ticket_id = (
+        message.get("origin_ticket_id")
+        or (message.get("recipient") or {}).get("ticket_id")
+        or (message.get("campaign") or {}).get("zendesk", {}).get("ticket_id")
+        or metadata.get("ticket_id")
+        or metadata.get("ticketId")
+    )
     if not origin_ticket_id and str(message.get("source_reference") or "").isdigit():
         origin_ticket_id = message.get("source_reference")
 

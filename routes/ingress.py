@@ -34,7 +34,11 @@ def ingress_legacy(app_id: str):
     try:
         payload, recipient = sanitize_legacy_payload(raw, app_id)
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
-        source_reference = config.safe_text(metadata.get("source_reference") or recipient["external_id"], 200)
+        ticket_id = recipient.get("ticket_id")
+        source_reference = config.safe_text(
+            str(ticket_id) if ticket_id else (metadata.get("source_reference") or recipient["external_id"]),
+            200,
+        )
         idempotency_key = config.safe_text(metadata.get("idempotency_key") or config.doc_id(canonical_json(payload)), 200)
         now_key = config.utcnow().strftime("%Y%m%d")
         campaign = {
@@ -45,6 +49,8 @@ def ingress_legacy(app_id: str):
                 "tags": ["cerebro_sunshine", "sin_disparo_whatsapp"],
             },
         }
+        if ticket_id:
+            campaign["zendesk"]["ticket_id"] = ticket_id
         message, duplicate = store_message(
             campaign_id="zendesk-legacy",
             run_id=f"zendesk-legacy-{now_key}",

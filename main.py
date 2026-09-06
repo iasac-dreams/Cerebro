@@ -762,7 +762,15 @@ def sanitize_legacy_payload(raw: dict, app_id: str) -> tuple[dict, dict]:
     expected_values = template_body_parameter_count(template_record) if template_record else 0
     if template_record and len(body_values) != expected_values:
         raise ValueError("template_body_parameter_count_mismatch")
-    return payload, {
+    raw_tid = raw.get("ticket_id") or raw.get("ticket") or metadata.get("ticket_id") or metadata.get("ticketId")
+    ticket_id = None
+    if raw_tid is not None:
+        try:
+            ticket_id = int(str(raw_tid).strip())
+        except (ValueError, TypeError):
+            ticket_id = None
+
+    recipient_info = {
         "phone": phone,
         "name": safe_text(metadata.get("name") or "Cliente", 200),
         "email": normalize_email(metadata.get("email")),
@@ -770,6 +778,9 @@ def sanitize_legacy_payload(raw: dict, app_id: str) -> tuple[dict, dict]:
         "template_name": detected_template,
         "template_snapshot": render_template_snapshot(template_record, body_values) if template_record else {},
     }
+    if ticket_id:
+        recipient_info["ticket_id"] = ticket_id
+    return payload, recipient_info
 
 
 def campaign_sunshine_payload(message: dict) -> tuple[dict, dict]:
@@ -865,6 +876,7 @@ def store_message(
         "source_channel": source_channel,
         "recipient": recipient,
         "template_name": recipient.get("template_name"),
+        "origin_ticket_id": recipient.get("ticket_id") or (campaign.get("zendesk") or {}).get("ticket_id"),
         "sunshine_payload": payload,
         "campaign": campaign,
         "status": "queued",
@@ -1628,7 +1640,11 @@ def create_app() -> Flask:
         try:
             payload, recipient = sanitize_legacy_payload(raw, app_id)
             metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
-            source_reference = safe_text(metadata.get("source_reference") or recipient["external_id"], 200)
+            ticket_id = recipient.get("ticket_id")
+            source_reference = safe_text(
+                str(ticket_id) if ticket_id else (metadata.get("source_reference") or recipient["external_id"]),
+                200,
+            )
             idempotency_key = safe_text(metadata.get("idempotency_key") or doc_id(canonical_json(payload)), 200)
             now_key = utcnow().strftime("%Y%m%d")
             campaign = {
@@ -1639,6 +1655,8 @@ def create_app() -> Flask:
                     "tags": ["cerebro_sunshine", "sin_disparo_whatsapp"],
                 },
             }
+            if ticket_id:
+                campaign["zendesk"]["ticket_id"] = ticket_id
             message, duplicate = store_message(
                 campaign_id="zendesk-legacy",
                 run_id=f"zendesk-legacy-{now_key}",
@@ -2206,7 +2224,13 @@ def task_zendesk_handler(body: dict):
     metadata = sunshine_payload.get("metadata") if isinstance(sunshine_payload.get("metadata"), dict) else {}
     if not metadata and isinstance(message.get("metadata"), dict):
         metadata = message.get("metadata") or {}
-    origin_ticket_id = metadata.get("ticket_id") or metadata.get("ticketId")
+    origin_ticket_id = (
+        message.get("origin_ticket_id")
+        or (message.get("recipient") or {}).get("ticket_id")
+        or (message.get("campaign") or {}).get("zendesk", {}).get("ticket_id")
+        or metadata.get("ticket_id")
+        or metadata.get("ticketId")
+    )
     if not origin_ticket_id and str(message.get("source_reference") or "").isdigit():
         origin_ticket_id = message.get("source_reference")
 

@@ -75,7 +75,15 @@ def sanitize_legacy_payload(raw: dict, app_id: str) -> tuple[dict, dict]:
     expected_values = template_body_parameter_count(template_record) if template_record else 0
     if template_record and len(body_values) != expected_values:
         raise ValueError("template_body_parameter_count_mismatch")
-    return payload, {
+    raw_tid = raw.get("ticket_id") or raw.get("ticket") or metadata.get("ticket_id") or metadata.get("ticketId")
+    ticket_id = None
+    if raw_tid is not None:
+        try:
+            ticket_id = int(str(raw_tid).strip())
+        except (ValueError, TypeError):
+            ticket_id = None
+
+    recipient_info = {
         "phone": phone,
         "name": config.safe_text(metadata.get("name") or "Cliente", 200),
         "email": config.normalize_email(metadata.get("email")),
@@ -83,6 +91,9 @@ def sanitize_legacy_payload(raw: dict, app_id: str) -> tuple[dict, dict]:
         "template_name": detected_template,
         "template_snapshot": render_template_snapshot(template_record, body_values) if template_record else {},
     }
+    if ticket_id:
+        recipient_info["ticket_id"] = ticket_id
+    return payload, recipient_info
 
 
 def campaign_sunshine_payload(message: dict) -> tuple[dict, dict]:
@@ -178,6 +189,7 @@ def store_message(
         "source_channel": source_channel,
         "recipient": recipient,
         "template_name": recipient.get("template_name"),
+        "origin_ticket_id": recipient.get("ticket_id") or (campaign.get("zendesk") or {}).get("ticket_id"),
         "sunshine_payload": payload,
         "campaign": campaign,
         "status": "queued",
