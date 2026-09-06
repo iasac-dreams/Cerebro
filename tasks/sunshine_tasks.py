@@ -1,6 +1,5 @@
-"""Sunshine dispatch worker with rate limit backoff and anti-duplication guards."""
-from __future__ import annotations
-
+import logging
+import time
 from datetime import timedelta
 from flask import jsonify, request
 from google.cloud import firestore
@@ -14,6 +13,8 @@ from clients.sunshine import (
 )
 from services.template_service import sync_templates
 from tasks.event_tasks import emit_event, enqueue_callback
+
+logger = logging.getLogger(__name__)
 
 
 def handle_sunshine_task(body: dict):
@@ -70,11 +71,17 @@ def handle_sunshine_task(body: dict):
     if not claim(db().transaction()):
         return jsonify({"status": "already_claimed"})
 
+    logger.info("[SUNSHINE TASK CLAIMED] message_id=%s", message_id)
+    logger.info("[SUNSHINE REQUEST START] message_id=%s", message_id)
+    start_time = time.monotonic()
+
     try:
         response = send_notification(wire)
+        duration_ms = int((time.monotonic() - start_time) * 1000)
         if response.status_code == 429:
             attempt = int(message.get("retry_attempt", 0)) + 1
             delay = config.retry_delay(attempt, response.headers.get("Retry-After", ""))
+            logger.warning("[SUNSHINE RESPONSE] message_id=%s status=429 duration_ms=%d attempt=%d", message_id, duration_ms, attempt)
             ref.set({"status": "queued" if attempt < 12 else "failed", "retry_attempt": attempt}, merge=True)
             if attempt < 12:
                 enqueue_task(
@@ -86,8 +93,10 @@ def handle_sunshine_task(body: dict):
                 )
             return jsonify({"status": "retry_scheduled" if attempt < 12 else "failed"})
         if response.status_code >= 500:
+            logger.warning("[SUNSHINE RESPONSE] message_id=%s status=%d duration_ms=%d ambiguous_provider_failure", message_id, response.status_code, duration_ms)
             raise requests.Timeout("ambiguous_provider_failure")
         if response.status_code == 423:
+            logger.warning("[SUNSHINE RESPONSE] message_id=%s status=423 duration_ms=%d conversation_locked", message_id, duration_ms)
             ref.set(
                 {"status": "conversation_locked", "error": "sunshine_423", "updated_at": firestore.SERVER_TIMESTAMP},
                 merge=True,
@@ -105,11 +114,15 @@ def handle_sunshine_task(body: dict):
                 provider_error = response.json().get("error") or {}
             except ValueError:
                 provider_error = {}
+            code = config.safe_text(provider_error.get("code"), 100)
+            desc = config.safe_text(provider_error.get("description"), 500)
+            logger.warning("[SUNSHINE RESPONSE] message_id=%s status=%d duration_ms=%d code=%s desc=%s", message_id, response.status_code, duration_ms, code or "-", desc or "-")
+            logger.warning("[SUNSHINE FAILED] message_id=%s status=%d code=%s", message_id, response.status_code, code or "-")
             ref.set(
                 {
                     "provider_error": {
-                        "code": config.safe_text(provider_error.get("code"), 100),
-                        "description": config.safe_text(provider_error.get("description"), 1000),
+                        "code": code,
+                        "description": desc,
                     }
                 },
                 merge=True,
@@ -130,13 +143,16 @@ def handle_sunshine_task(body: dict):
         try:
             result = response.json()
         except ValueError:
+            logger.warning("[SUNSHINE RESPONSE] message_id=%s status=%d invalid_json", message_id, response.status_code)
             raise requests.Timeout("invalid_accepted_response")
         if not isinstance(result, dict):
             raise requests.Timeout("invalid_accepted_response")
         notification_id = sunshine_notification_id(result)
         if not notification_id:
+            logger.warning("[SUNSHINE RESPONSE] message_id=%s missing notification_id", message_id)
             raise requests.Timeout("sunshine_missing_notification_id")
 
+        logger.info("[SUNSHINE RESPONSE] message_id=%s status=%d duration_ms=%d notification_id=%s", message_id, response.status_code, duration_ms, notification_id)
         ref.set(
             {
                 "status": "submitted",
@@ -152,9 +168,10 @@ def handle_sunshine_task(body: dict):
         message["notification_id"] = notification_id
         submitted_event_id = emit_event(message, "submitted")
         enqueue_callback(message, submitted_event_id, "submitted")
+        logger.info("[SUNSHINE SUBMITTED] message_id=%s notification_id=%s", message_id, notification_id)
         return jsonify({"message_id": message_id, "notification_id": notification_id, "status": "submitted"})
     except requests.Timeout:
-        # Ambiguous response after timeout: mark delivery_unknown to prevent double-sending
+        logger.warning("[SUNSHINE DELIVERY UNKNOWN] message_id=%s error=sunshine_timeout", message_id)
         ref.set(
             {"status": "delivery_unknown", "error": "sunshine_timeout", "updated_at": firestore.SERVER_TIMESTAMP},
             merge=True,
@@ -167,6 +184,7 @@ def handle_sunshine_task(body: dict):
             {"error": {"code": "sunshine_timeout", "message": "Delivery result unknown after timeout"}},
         )
         return jsonify({"status": "delivery_unknown"}), 200
-    except requests.RequestException:
+    except requests.RequestException as err:
+        logger.warning("[SUNSHINE DELIVERY UNKNOWN] message_id=%s error=sunshine_network_failure detail=%s", message_id, type(err).__name__)
         ref.set({"status": "delivery_unknown", "error": "sunshine_network_failure"}, merge=True)
         return jsonify({"status": "delivery_unknown"})

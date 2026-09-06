@@ -86,15 +86,19 @@ def handle_zendesk_task(body: dict):
     if not snapshot.exists:
         return jsonify({"error": "message_not_found"}), 404
     message = snapshot.to_dict() or {}
-    if message.get("ticket_id"):
-        return jsonify({"ticket_id": message["ticket_id"], "duplicate_task": True})
+    if message.get("ticket_updated_at") or (message.get("ticket_id") and not message.get("origin_ticket_id")):
+        return jsonify({"ticket_id": message.get("ticket_id"), "duplicate_task": True})
 
     message_content = resolve_message_content(message)
     campaign_name = (message.get("campaign") or {}).get("campaign_name") or message.get("campaign_id") or "WhatsApp"
+    recipient = message.get("recipient") or {}
+    masked_phone = config.mask_phone(recipient.get("phone"))
     comment_body = (
         f"WhatsApp entregado al usuario:\n\n"
         f"{message_content}\n\n"
         f"----------------------------------------\n"
+        f"Destinatario: {masked_phone}\n"
+        f"Plantilla: {message.get('template_name') or 'N/A'}\n"
         f"Campaña: {campaign_name}\n"
         f"Run: {message.get('run_id') or 'N/A'}\n"
         f"Notification ID: {message.get('notification_id') or 'N/A'}"
@@ -116,19 +120,36 @@ def handle_zendesk_task(body: dict):
         origin_ticket_id = message.get("source_reference")
 
     if origin_ticket_id:
+        logger.info("[ZENDESK TICKET UPDATE START] ticket_id=%s message_id=%s", origin_ticket_id, message_id)
         try:
-            if update_ticket_internal_note(origin_ticket_id, comment_body, ["cerebro_sunshine", "sin_disparo_whatsapp"]):
+            ok = update_ticket_internal_note(
+                origin_ticket_id,
+                comment_body,
+                ["cerebro_sunshine", "sin_disparo_whatsapp", "whatsapp_entregado"],
+            )
+            if ok:
                 tid = int(origin_ticket_id)
-                message_ref.set({"ticket_id": tid, "ticket_updated_at": firestore.SERVER_TIMESTAMP, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
+                message_ref.set({
+                    "ticket_id": tid,
+                    "ticket_updated_at": firestore.SERVER_TIMESTAMP,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                }, merge=True)
                 message["ticket_id"] = tid
                 ev_id = emit_event(message, "zendesk_ticket_updated", {"ticket_id": tid})
                 enqueue_callback(message, ev_id, "zendesk_ticket_updated", {"ticket_id": tid})
+                logger.info("[ZENDESK TICKET UPDATED] ticket_id=%s message_id=%s", tid, message_id)
                 return jsonify({"ticket_id": tid, "updated": True})
-        except Exception as e:
-            logger.warning("No se pudo actualizar ticket origen %s, se creará uno nuevo: %s", origin_ticket_id, e)
+            else:
+                logger.warning("[ZENDESK TICKET UPDATE ERROR] ticket_id=%s message_id=%s non-200 response", origin_ticket_id, message_id)
+                return jsonify({"error": "zendesk_update_failed"}), 503
+        except requests.RequestException as exc:
+            logger.warning("[ZENDESK TICKET UPDATE ERROR] ticket_id=%s message_id=%s request_error=%s", origin_ticket_id, message_id, exc)
+            return jsonify({"error": "zendesk_temporary_failure"}), 503
+        except Exception as exc:
+            logger.warning("[ZENDESK TICKET UPDATE ERROR] ticket_id=%s message_id=%s unexpected_error=%s", origin_ticket_id, message_id, exc)
+            return jsonify({"error": "zendesk_update_exception"}), 500
 
     # 2. Si no viene ticket_id previo, crear un nuevo ticket resuelto para trazabilidad
-    recipient = message.get("recipient") or {}
     external_id = f"cerebro-{message_id}"
     try:
         existing_ticket_id = search_ticket(external_id)

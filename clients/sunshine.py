@@ -48,31 +48,45 @@ def _register_sunshine_webhook(app_id: str, key_id: str, secret_key: str):
     target = (os.getenv("SUNSHINE_WEBHOOK_TARGET") or f"{gateway_url.rstrip('/')}/webhooks/sunshine").rstrip("/")
     url = f"{config.SUNSHINE_API_ROOT}/v1.1/apps/{app_id}/webhooks"
     desired = set(SUNSHINE_WEBHOOK_TRIGGERS)
+    webhook_token = os.getenv("SUNSHINE_WEBHOOK_TOKEN") or config.SUNSHINE_WEBHOOK_SECRET
+    logger.info("[SUNSHINE WEBHOOK SETUP START] target=%s", target)
     try:
         session = http_session()
         response = session.get(url, auth=(key_id, secret_key), timeout=15)
         if response.status_code != 200:
-            logger.warning("[SUNSHINE WEBHOOK] GET webhooks returned %s: %s", response.status_code, response.text[:500])
+            logger.warning("[SUNSHINE WEBHOOK SETUP ERROR] GET webhooks returned %s: %s", response.status_code, response.text[:200])
             return
         webhooks = response.json().get("webhooks", [])
+        logger.info("[SUNSHINE WEBHOOK LIST] found=%d webhooks", len(webhooks))
         existing = next((item for item in webhooks if str(item.get("target", "")).rstrip("/") == target), None)
         body = {
             "target": target,
             "triggers": SUNSHINE_WEBHOOK_TRIGGERS,
             "includeFullAppUser": False,
         }
-        if existing and desired.issubset(set(existing.get("triggers") or [])):
+        if webhook_token:
+            body["headers"] = {"X-Webhook-Token": webhook_token}
+
+        headers_match = True
+        if webhook_token:
+            existing_token = (existing.get("headers") or {}).get("X-Webhook-Token") if existing else ""
+            headers_match = (existing_token == webhook_token)
+
+        if existing and desired.issubset(set(existing.get("triggers") or [])) and headers_match:
             _sunshine_webhook_secret = existing.get("secret") or _sunshine_webhook_secret
             _sunshine_webhook_ready = True
             logger.info("[SUNSHINE WEBHOOK ACTIVE] id=%s target=%s", existing.get("_id"), target)
             _store_webhook_secret(_sunshine_webhook_secret)
             return
+
         if existing:
+            logger.info("[SUNSHINE WEBHOOK UPDATE] id=%s target=%s", existing.get("_id"), target)
             response = session.put(f"{url}/{existing['_id']}", auth=(key_id, secret_key), json=body, timeout=15)
         else:
             response = session.post(url, auth=(key_id, secret_key), json=body, timeout=15)
+
         if response.status_code not in (200, 201):
-            logger.warning("[SUNSHINE WEBHOOK] Save webhook returned %s: %s", response.status_code, response.text[:500])
+            logger.warning("[SUNSHINE WEBHOOK SETUP ERROR] Save webhook returned %s: %s", response.status_code, response.text[:200])
             return
         saved = response.json().get("webhook", {})
         _sunshine_webhook_secret = saved.get("secret") or _sunshine_webhook_secret

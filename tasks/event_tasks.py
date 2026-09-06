@@ -1,6 +1,4 @@
-"""Lifecycle event emission, webhook processing, callbacks and report delivery."""
-from __future__ import annotations
-
+import logging
 import uuid
 from datetime import timedelta
 from flask import jsonify
@@ -10,6 +8,8 @@ import requests
 import config
 from extensions import db, enqueue_task, http_session
 from services.reporting_service import run_report
+
+logger = logging.getLogger(__name__)
 
 
 def emit_event(message: dict, status: str, details: dict | None = None, *, event_id: str | None = None) -> str:
@@ -73,7 +73,9 @@ def enqueue_callback(message: dict, event_id: str, status: str, details: dict | 
 
 def enqueue_ticket(message: dict, event_id: str):
     zendesk = (message.get("campaign") or {}).get("zendesk") or {}
-    if zendesk.get("create_ticket_on") not in {"delivered", "user_delivered"}:
+    create_on = zendesk.get("create_ticket_on") in {"delivered", "user_delivered"}
+    has_origin = bool(message.get("origin_ticket_id") or (message.get("recipient") or {}).get("ticket_id"))
+    if not (create_on or has_origin):
         return
     enqueue_task(
         config.ZENDESK_QUEUE,
@@ -91,16 +93,19 @@ def handle_event_task(body: dict):
         return jsonify({"error": "event_not_found"}), 404
     stored = snapshot.to_dict() or {}
     if stored.get("processed_at"):
+        logger.info("[SUNSHINE WEBHOOK DUPLICATE] event_id=%s already_processed", event_id)
         return jsonify({"status": "already_processed"})
     event = stored.get("raw") or {}
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else event
     notification = payload.get("notification") if isinstance(payload.get("notification"), dict) else event.get("notification") or {}
     notification_id = str(notification.get("id") or notification.get("_id") or "")
     if not notification_id:
+        logger.info("[SUNSHINE WEBHOOK IGNORED] event_id=%s reason=missing_notification_id", event_id)
         event_ref.set({"processed_at": firestore.SERVER_TIMESTAMP, "result": "missing_notification_id"}, merge=True)
         return jsonify({"status": "ignored"})
     index = db().collection(config.NOTIFICATION_INDEX).document(notification_id).get()
     if not index.exists:
+        logger.warning("[SUNSHINE WEBHOOK PENDING] notification_id=%s index_pending", notification_id)
         return jsonify({"error": "notification_index_pending"}), 503
     message_ref = db().collection(config.MESSAGES).document(index.to_dict()["message_id"])
     message_snapshot = message_ref.get()
@@ -119,6 +124,7 @@ def handle_event_task(body: dict):
     }
     status = status_map.get(trigger)
     if not status:
+        logger.info("[SUNSHINE WEBHOOK IGNORED] event_id=%s trigger=%s reason=unsupported_trigger", event_id, trigger)
         event_ref.set({"processed_at": firestore.SERVER_TIMESTAMP, "result": "unsupported_trigger"}, merge=True)
         return jsonify({"status": "ignored"})
     update = {"status": status, "updated_at": firestore.SERVER_TIMESTAMP, "last_event_id": event_id}
@@ -137,6 +143,7 @@ def handle_event_task(body: dict):
         return True
 
     if not advance(db().transaction()):
+        logger.info("[SUNSHINE WEBHOOK IGNORED] event_id=%s notification_id=%s reason=ignored_after_final", event_id, notification_id)
         event_ref.set({"processed_at": firestore.SERVER_TIMESTAMP, "result": "ignored_after_final"}, merge=True)
         return jsonify({"status": "ignored_after_final"})
 
@@ -145,6 +152,14 @@ def handle_event_task(body: dict):
     if status == "user_delivered":
         enqueue_ticket(message, emitted_id)
     event_ref.set({"processed_at": firestore.SERVER_TIMESTAMP, "result": status, "message_id": message.get("message_id")}, merge=True)
+    logger.info(
+        "[SUNSHINE WEBHOOK PROCESSED] event_id=%s notification_id=%s trigger=%s previous_status=%s new_status=%s",
+        event_id,
+        notification_id,
+        trigger,
+        message.get("status"),
+        status,
+    )
     return jsonify({"status": status, "message_id": message.get("message_id")})
 
 

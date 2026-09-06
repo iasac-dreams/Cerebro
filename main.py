@@ -95,6 +95,7 @@ SUNSHINE_APP_ID = os.getenv("SUNSHINE_APP_ID", "")
 SUNSHINE_KEY_ID = os.getenv("SUNSHINE_KEY_ID", "")
 SUNSHINE_SECRET_KEY = os.getenv("SUNSHINE_SECRET_KEY", "")
 SUNSHINE_WEBHOOK_SECRET = os.getenv("SUNSHINE_WEBHOOK_SECRET", "")
+SUNSHINE_WEBHOOK_TOKEN = os.getenv("SUNSHINE_WEBHOOK_TOKEN", "") or SUNSHINE_WEBHOOK_SECRET
 SUNSHINE_INTEGRATION_ID = os.getenv("SUNSHINE_INTEGRATION_ID", "")
 SUNSHINE_NAMESPACE = os.getenv("SUNSHINE_TEMPLATE_NAMESPACE", "")
 SUNSHINE_JSON_LIMIT = int(os.getenv("SUNSHINE_JSON_LIMIT_BYTES", "95000"))
@@ -220,6 +221,42 @@ def normalize_email(value: Any) -> str | None:
     if not EMAIL_RE.fullmatch(email):
         raise ValueError("invalid_email")
     return email
+
+
+def mask_phone(phone: Any) -> str:
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if len(digits) >= 4:
+        return f"***{digits[-4:]}"
+    return "***"
+
+
+def normalize_ticket_id(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if not s.isdigit() or int(s) <= 0:
+        raise ValueError("invalid_ticket_id")
+    return int(s)
+
+
+def normalize_https_url(value: Any) -> str:
+    s = str(value or "").strip()
+    if not s:
+        raise ValueError("invalid_image_url")
+    if len(s) > 2048:
+        raise ValueError("invalid_image_url")
+    if "[" in s or "]" in s or "(" in s or ")" in s:
+        raise ValueError("invalid_image_url")
+    parsed = urlparse(s)
+    if parsed.scheme.lower() != "https" or not parsed.netloc or not parsed.hostname:
+        raise ValueError("invalid_image_url")
+    if parsed.username or parsed.password:
+        raise ValueError("invalid_image_url")
+    if parsed.port not in (None, 443):
+        raise ValueError("invalid_image_url")
+    return s
 
 
 def safe_text(value: Any, maximum: int = 500) -> str:
@@ -597,31 +634,45 @@ def _register_sunshine_webhook(app_id: str, key_id: str, secret_key: str):
     target = (os.getenv("SUNSHINE_WEBHOOK_TARGET") or f"{gateway_url.rstrip('/')}/webhooks/sunshine").rstrip("/")
     url = f"{SUNSHINE_API_ROOT}/v1.1/apps/{app_id}/webhooks"
     desired = set(SUNSHINE_WEBHOOK_TRIGGERS)
+    webhook_token = os.getenv("SUNSHINE_WEBHOOK_TOKEN") or SUNSHINE_WEBHOOK_SECRET
+    logger.info("[SUNSHINE WEBHOOK SETUP START] target=%s", target)
     try:
         session = http_session()
         response = session.get(url, auth=(key_id, secret_key), timeout=15)
         if response.status_code != 200:
-            logger.warning("[SUNSHINE WEBHOOK] GET webhooks returned %s: %s", response.status_code, response.text[:500])
+            logger.warning("[SUNSHINE WEBHOOK SETUP ERROR] GET webhooks returned %s: %s", response.status_code, response.text[:200])
             return
         webhooks = response.json().get("webhooks", [])
+        logger.info("[SUNSHINE WEBHOOK LIST] found=%d webhooks", len(webhooks))
         existing = next((item for item in webhooks if str(item.get("target", "")).rstrip("/") == target), None)
         body = {
             "target": target,
             "triggers": SUNSHINE_WEBHOOK_TRIGGERS,
             "includeFullAppUser": False,
         }
-        if existing and desired.issubset(set(existing.get("triggers") or [])):
+        if webhook_token:
+            body["headers"] = {"X-Webhook-Token": webhook_token}
+
+        headers_match = True
+        if webhook_token:
+            existing_token = (existing.get("headers") or {}).get("X-Webhook-Token") if existing else ""
+            headers_match = (existing_token == webhook_token)
+
+        if existing and desired.issubset(set(existing.get("triggers") or [])) and headers_match:
             _sunshine_webhook_secret = existing.get("secret") or _sunshine_webhook_secret
             _sunshine_webhook_ready = True
             logger.info("[SUNSHINE WEBHOOK ACTIVE] id=%s target=%s", existing.get("_id"), target)
             _store_webhook_secret(_sunshine_webhook_secret)
             return
+
         if existing:
+            logger.info("[SUNSHINE WEBHOOK UPDATE] id=%s target=%s", existing.get("_id"), target)
             response = session.put(f"{url}/{existing['_id']}", auth=(key_id, secret_key), json=body, timeout=15)
         else:
             response = session.post(url, auth=(key_id, secret_key), json=body, timeout=15)
+
         if response.status_code not in (200, 201):
-            logger.warning("[SUNSHINE WEBHOOK] Save webhook returned %s: %s", response.status_code, response.text[:500])
+            logger.warning("[SUNSHINE WEBHOOK SETUP ERROR] Save webhook returned %s: %s", response.status_code, response.text[:200])
             return
         saved = response.json().get("webhook", {})
         _sunshine_webhook_secret = saved.get("secret") or _sunshine_webhook_secret
@@ -873,70 +924,248 @@ def ensure_message_dispatch(message: dict) -> None:
         ref.update({"queued_event_recorded_at": firestore.SERVER_TIMESTAMP})
 
 
-def legacy_body_values(message: dict) -> list[str]:
-    template = message.get("template") if isinstance(message.get("template"), dict) else {}
-    for component in template.get("components") or []:
-        if isinstance(component, dict) and str(component.get("type") or "").lower() == "body":
-            return [
-                safe_text(parameter.get("text"), 1000)
-                for parameter in component.get("parameters") or []
-                if isinstance(parameter, dict) and parameter.get("type") == "text"
-            ]
-    return []
+def sanitize_template_parameter(param: dict) -> dict:
+    if not isinstance(param, dict):
+        raise ValueError("invalid_template_parameter")
+    ptype = str(param.get("type") or "").strip().lower()
+    if ptype == "text":
+        return {"type": "text", "text": safe_text(param.get("text"), 1000)}
+    elif ptype == "image":
+        img = param.get("image") if isinstance(param.get("image"), dict) else {}
+        link = normalize_https_url(img.get("link") or param.get("link"))
+        return {"type": "image", "image": {"link": link}}
+    elif ptype == "document":
+        doc = param.get("document") if isinstance(param.get("document"), dict) else {}
+        link = normalize_https_url(doc.get("link") or param.get("link"))
+        res = {"link": link}
+        if doc.get("filename"):
+            res["filename"] = safe_text(doc["filename"], 255)
+        return {"type": "document", "document": res}
+    elif ptype == "video":
+        vid = param.get("video") if isinstance(param.get("video"), dict) else {}
+        link = normalize_https_url(vid.get("link") or param.get("link"))
+        return {"type": "video", "video": {"link": link}}
+    elif ptype == "payload":
+        return {"type": "payload", "payload": safe_text(param.get("payload"), 1000)}
+    else:
+        raise ValueError(f"invalid_template_parameter_type: {ptype}" if ptype else "invalid_template_parameter_type")
 
 
-def sanitize_legacy_payload(raw: dict, app_id: str | None = None) -> tuple[dict, dict]:
-    app_id = app_id or SUNSHINE_APP_ID
-    if SUNSHINE_APP_ID and app_id != SUNSHINE_APP_ID:
+def sanitize_template_components(components: list) -> list:
+    if not isinstance(components, list):
+        return []
+    sanitized = []
+    for comp in components:
+        if not isinstance(comp, dict):
+            continue
+        ctype = str(comp.get("type") or "").strip().lower()
+        if ctype == "header":
+            raw_params = comp.get("parameters") or []
+            if not isinstance(raw_params, list):
+                raise ValueError("invalid_template_component")
+            params = [sanitize_template_parameter(p) for p in raw_params if isinstance(p, dict)]
+            sanitized.append({"type": "header", "parameters": params})
+        elif ctype == "body":
+            raw_params = comp.get("parameters") or []
+            if not isinstance(raw_params, list):
+                raise ValueError("invalid_template_component")
+            params = []
+            for p in raw_params:
+                if isinstance(p, dict):
+                    sp = sanitize_template_parameter(p)
+                    if sp.get("type") != "text":
+                        raise ValueError("invalid_template_component")
+                    params.append(sp)
+            sanitized.append({"type": "body", "parameters": params})
+        elif ctype == "button":
+            sub_type = str(comp.get("sub_type") or "url").strip().lower()
+            if sub_type not in ("url", "quick_reply"):
+                sub_type = "url"
+            index = str(comp.get("index") or "0").strip()
+            if not index.isdigit() or not (0 <= int(index) <= 9):
+                raise ValueError("invalid_template_component")
+            raw_params = comp.get("parameters") or []
+            params = [sanitize_template_parameter(p) for p in raw_params if isinstance(p, dict)]
+            sanitized.append({
+                "type": "button",
+                "sub_type": sub_type,
+                "index": index,
+                "parameters": params,
+            })
+        else:
+            raise ValueError("invalid_template_component")
+    return sanitized
+
+
+def sanitize_scalar_metadata(metadata: dict) -> dict:
+    if not isinstance(metadata, dict):
+        return {}
+    clean = {}
+    for k, v in metadata.items():
+        key = safe_text(k, 100)
+        if not key or key.lower() in ("ticket_id", "ticketid"):
+            continue
+        if isinstance(v, (str, int, float, bool)):
+            clean[key] = safe_text(v, 1000) if isinstance(v, str) else v
+    serialized = json.dumps(clean, ensure_ascii=False)
+    if len(serialized.encode("utf-8")) > 4000:
+        raise ValueError("metadata_too_large")
+    return clean
+
+
+def parse_incoming_notification(raw: dict, app_id: str | None = None) -> dict:
+    if not isinstance(raw, dict):
+        raise ValueError("json_object_required")
+    effective_app = app_id or SUNSHINE_APP_ID
+    if SUNSHINE_APP_ID and effective_app != SUNSHINE_APP_ID:
         raise ValueError("unknown_sunshine_app")
+    return raw
+
+
+def normalize_incoming_notification(raw: dict, app_id: str | None = None) -> dict:
+    raw = parse_incoming_notification(raw, app_id)
     destination = raw.get("destination") if isinstance(raw.get("destination"), dict) else {}
     message = raw.get("message") if isinstance(raw.get("message"), dict) else {}
     if not message:
         raise ValueError("message_required")
-    integration_id = safe_text(destination.get("integrationId") or SUNSHINE_INTEGRATION_ID, 200)
-    if SUNSHINE_INTEGRATION_ID and integration_id and integration_id != SUNSHINE_INTEGRATION_ID:
-        raise ValueError("unknown_sunshine_integration")
+
     phone_raw = destination.get("destinationId") or raw.get("phone") or raw.get("destinationId")
     phone = normalize_phone(phone_raw)
-    payload = {
-        "destination": {"integrationId": integration_id, "destinationId": phone},
-        "author": {"role": "appMaker"},
-        "message": message,
-    }
-    if raw.get("messageSchema"):
-        payload["messageSchema"] = safe_text(raw.get("messageSchema"), 30)
+
+    integration_id = safe_text(destination.get("integrationId") or SUNSHINE_INTEGRATION_ID, 200)
+
+    raw_metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    raw_tid = raw.get("ticket_id") or raw.get("ticket") or raw_metadata.get("ticket_id") or raw_metadata.get("ticketId")
+    ticket_id = normalize_ticket_id(raw_tid)
+
+    msg_type = str(message.get("type") or "template").strip().lower()
+    if msg_type not in ("template", "text"):
+        raise ValueError("invalid_message_type")
+
+    template_name = ""
+    template_lang = "es"
+    template_namespace_val = ""
+    template_components = []
+    text_content = ""
+
+    if msg_type == "template":
+        tmpl = message.get("template") if isinstance(message.get("template"), dict) else {}
+        template_name = safe_text(tmpl.get("name") or message.get("template_name"), 200)
+        if not template_name:
+            raise ValueError("template_name_required")
+        lang_val = tmpl.get("language")
+        if isinstance(lang_val, dict):
+            template_lang = safe_text(lang_val.get("code") or "es", 20)
+        elif isinstance(lang_val, str) and lang_val:
+            template_lang = safe_text(lang_val, 20)
+        else:
+            template_lang = "es"
+
+        template_namespace_val = SUNSHINE_NAMESPACE or safe_text(tmpl.get("namespace"), 200)
+        template_components = sanitize_template_components(tmpl.get("components") or [])
     else:
+        text_content = safe_text(message.get("text"), 4000)
+        if not text_content:
+            raise ValueError("text_required")
+
+    clean_metadata = sanitize_scalar_metadata(raw_metadata)
+
+    return {
+        "ticket_id": ticket_id,
+        "destination_phone": phone,
+        "integration_id": integration_id,
+        "message_type": msg_type,
+        "template_name": template_name,
+        "template_language": template_lang,
+        "template_namespace": template_namespace_val,
+        "template_components": template_components,
+        "text_content": text_content,
+        "metadata": clean_metadata,
+        "external_id": safe_text(clean_metadata.get("external_id") or raw_metadata.get("external_id") or phone, 200),
+        "name": safe_text(clean_metadata.get("name") or raw_metadata.get("name") or "Cliente", 200),
+        "email": normalize_email(clean_metadata.get("email") or raw_metadata.get("email")),
+    }
+
+
+def validate_incoming_notification(normalized: dict) -> dict:
+    if normalized["message_type"] == "template":
+        tmpl_name = normalized["template_name"]
+        tmpl_lang = normalized["template_language"]
+        tmpl_record = approved_template(tmpl_name, tmpl_lang)
+
+        body_values = []
+        for comp in normalized["template_components"]:
+            if comp.get("type") == "body":
+                for p in comp.get("parameters") or []:
+                    if p.get("type") == "text":
+                        body_values.append(p.get("text", ""))
+
+        expected_values = template_body_parameter_count(tmpl_record) if tmpl_record else 0
+        if tmpl_record and len(body_values) != expected_values:
+            raise ValueError("template_body_parameter_count_mismatch")
+
+        snapshot = render_template_snapshot(tmpl_record, body_values) if tmpl_record else {}
+        normalized["template_snapshot"] = snapshot
+        normalized["body_values"] = body_values
+    else:
+        normalized["template_snapshot"] = {}
+        normalized["body_values"] = []
+    return normalized
+
+
+def build_sunshine_notification(normalized: dict) -> dict:
+    dest = {"destinationId": normalized["destination_phone"]}
+    if normalized.get("integration_id"):
+        dest["integrationId"] = normalized["integration_id"]
+    payload = {
+        "destination": dest,
+        "author": {
+            "role": "appMaker",
+        },
+    }
+    if normalized["message_type"] == "template":
         payload["messageSchema"] = "whatsapp"
-    if isinstance(raw.get("metadata"), dict):
-        payload["metadata"] = raw["metadata"]
+        tmpl_obj = {
+            "name": normalized["template_name"],
+            "language": {
+                "policy": "deterministic",
+                "code": normalized["template_language"],
+            },
+            "components": normalized["template_components"],
+        }
+        if normalized.get("template_namespace"):
+            tmpl_obj["namespace"] = normalized["template_namespace"]
+        payload["message"] = {
+            "type": "template",
+            "template": tmpl_obj,
+        }
+    else:
+        payload["message"] = {
+            "type": "text",
+            "text": normalized["text_content"],
+        }
+    if normalized.get("metadata"):
+        payload["metadata"] = normalized["metadata"]
+
     sunshine_wire_payload(payload)
-    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
-    detected_template = template_name_from_payload(payload)
-    language_obj = ((message.get("template") or {}).get("language") or {}) if isinstance(message.get("template"), dict) else {}
-    detected_language = safe_text(language_obj.get("code") if isinstance(language_obj, dict) else language_obj, 20) or "es"
-    template_record = approved_template(detected_template, detected_language)
-    body_values = legacy_body_values(message)
-    expected_values = template_body_parameter_count(template_record) if template_record else 0
-    if template_record and len(body_values) != expected_values:
-        raise ValueError("template_body_parameter_count_mismatch")
-    raw_tid = raw.get("ticket_id") or raw.get("ticket") or metadata.get("ticket_id") or metadata.get("ticketId")
-    ticket_id = None
-    if raw_tid is not None:
-        try:
-            ticket_id = int(str(raw_tid).strip())
-        except (ValueError, TypeError):
-            ticket_id = None
+    return payload
+
+
+def sanitize_legacy_payload(raw: dict, app_id: str | None = None) -> tuple[dict, dict]:
+    normalized = normalize_incoming_notification(raw, app_id)
+    validated = validate_incoming_notification(normalized)
+    payload = build_sunshine_notification(validated)
 
     recipient_info = {
-        "phone": phone,
-        "name": safe_text(metadata.get("name") or "Cliente", 200),
-        "email": normalize_email(metadata.get("email")),
-        "external_id": safe_text(metadata.get("external_id") or phone, 200),
-        "template_name": detected_template,
-        "template_snapshot": render_template_snapshot(template_record, body_values) if template_record else {},
+        "phone": validated["destination_phone"],
+        "name": validated["name"],
+        "email": validated["email"],
+        "external_id": validated["external_id"],
+        "template_name": validated["template_name"],
+        "template_snapshot": validated.get("template_snapshot") or {},
     }
-    if ticket_id:
-        recipient_info["ticket_id"] = ticket_id
+    if validated.get("ticket_id"):
+        recipient_info["ticket_id"] = validated["ticket_id"]
     return payload, recipient_info
 
 
@@ -1024,6 +1253,9 @@ def store_message(
     source_channel: str,
 ) -> tuple[dict, bool]:
     message_id = doc_id(campaign_id, run_id, idempotency_key)
+    wire = sunshine_wire_payload(payload)
+    payload_hash = doc_id(wire)
+    origin_ticket_id = recipient.get("ticket_id") or (campaign.get("zendesk") or {}).get("ticket_id")
     message = {
         "message_id": message_id,
         "campaign_id": campaign_id,
@@ -1033,8 +1265,9 @@ def store_message(
         "source_channel": source_channel,
         "recipient": recipient,
         "template_name": recipient.get("template_name"),
-        "origin_ticket_id": recipient.get("ticket_id") or (campaign.get("zendesk") or {}).get("ticket_id"),
+        "origin_ticket_id": origin_ticket_id,
         "sunshine_payload": payload,
+        "payload_hash": payload_hash,
         "campaign": campaign,
         "status": "queued",
         "created_at": utcnow(),
@@ -1043,14 +1276,29 @@ def store_message(
     }
     try:
         db().collection(MESSAGES).document(message_id).create(message)
+        duplicate = False
     except AlreadyExists:
         existing = db().collection(MESSAGES).document(message_id).get().to_dict()
         if not existing:
             raise RuntimeError("message_disappeared_during_ingestion")
         ensure_message_dispatch(existing)
+        logger.info(
+            "[SUNSHINE DUPLICATE] message_id=%s run_id=%s idempotency_key=%s",
+            message_id,
+            run_id,
+            idempotency_key,
+        )
         return existing, True
 
     ensure_message_dispatch(message)
+    logger.info(
+        "[SUNSHINE MESSAGE STORED] message_id=%s status=%s duplicate=%s ticket_id=%s phone=%s",
+        message_id,
+        message["status"],
+        duplicate,
+        origin_ticket_id or "-",
+        mask_phone(recipient.get("phone")),
+    )
     return message, False
 
 
@@ -1373,7 +1621,9 @@ def enqueue_callback(message: dict, event_id: str, status: str, details: dict | 
 
 def enqueue_ticket(message: dict, event_id: str):
     zendesk = (message.get("campaign") or {}).get("zendesk") or {}
-    if zendesk.get("create_ticket_on") not in {"delivered", "user_delivered"}:
+    create_on = zendesk.get("create_ticket_on") in {"delivered", "user_delivered"}
+    has_origin = bool(message.get("origin_ticket_id") or (message.get("recipient") or {}).get("ticket_id"))
+    if not (create_on or has_origin):
         return
     enqueue_task(
         ZENDESK_QUEUE,
@@ -1795,6 +2045,18 @@ def create_app() -> Flask:
         raw = request.get_json(silent=True)
         if not isinstance(raw, dict):
             return jsonify({"error": "json_object_required"}), 400
+        request_id = request.headers.get("X-Request-Id") or doc_id(utcnow().isoformat())[:12]
+        raw_dest = raw.get("destination") or {}
+        raw_phone = raw_dest.get("destinationId") or raw.get("phone") or ""
+        raw_tmpl = ((raw.get("message") or {}).get("template") or {}).get("name") or "-"
+        raw_tid = raw.get("ticket_id") or ((raw.get("metadata") or {}).get("ticket_id")) or "-"
+        logger.info(
+            "[SUNSHINE INGRESS START] request_id=%s ticket_id=%s phone=%s template=%s",
+            request_id,
+            raw_tid,
+            mask_phone(raw_phone),
+            raw_tmpl,
+        )
         try:
             payload, recipient = sanitize_legacy_payload(raw, SUNSHINE_APP_ID)
             metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
@@ -1825,12 +2087,25 @@ def create_app() -> Flask:
                 campaign=campaign,
                 source_channel="zendesk_trigger",
             )
+            wire = canonical_json(payload)
+            logger.info(
+                "[SUNSHINE PAYLOAD BUILT] request_id=%s message_id=%s bytes=%d payload_hash=%s",
+                request_id,
+                message["message_id"],
+                len(wire),
+                doc_id(wire)[:12],
+            )
             return jsonify({
                 "message_id": message["message_id"],
                 "status": message.get("status"),
                 "duplicate": duplicate,
             }), 200 if duplicate else 202
         except ValueError as error:
+            logger.warning(
+                "[SUNSHINE INGRESS REJECTED] request_id=%s error=%s",
+                request_id,
+                str(error),
+            )
             return jsonify({"error": str(error)}), 413 if str(error) == "sunshine_payload_too_large" else 400
 
     @app.post("/internal/ingress/legacy/apps/<app_id>/notifications")
@@ -1839,6 +2114,19 @@ def create_app() -> Flask:
         raw = request.get_json(silent=True)
         if not isinstance(raw, dict):
             return jsonify({"error": "json_object_required"}), 400
+        request_id = request.headers.get("X-Request-Id") or doc_id(utcnow().isoformat())[:12]
+        raw_dest = raw.get("destination") or {}
+        raw_phone = raw_dest.get("destinationId") or raw.get("phone") or ""
+        raw_tmpl = ((raw.get("message") or {}).get("template") or {}).get("name") or "-"
+        raw_tid = raw.get("ticket_id") or ((raw.get("metadata") or {}).get("ticket_id")) or "-"
+        logger.info(
+            "[SUNSHINE INGRESS START] request_id=%s app_id=%s ticket_id=%s phone=%s template=%s",
+            request_id,
+            app_id,
+            raw_tid,
+            mask_phone(raw_phone),
+            raw_tmpl,
+        )
         try:
             payload, recipient = sanitize_legacy_payload(raw, app_id)
             metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
@@ -1869,12 +2157,25 @@ def create_app() -> Flask:
                 campaign=campaign,
                 source_channel="zendesk_legacy",
             )
+            wire = canonical_json(payload)
+            logger.info(
+                "[SUNSHINE PAYLOAD BUILT] request_id=%s message_id=%s bytes=%d payload_hash=%s",
+                request_id,
+                message["message_id"],
+                len(wire),
+                doc_id(wire)[:12],
+            )
             return jsonify({
                 "message_id": message["message_id"],
                 "status": message.get("status"),
                 "duplicate": duplicate,
             }), 200 if duplicate else 202
         except ValueError as error:
+            logger.warning(
+                "[SUNSHINE INGRESS REJECTED] request_id=%s error=%s",
+                request_id,
+                str(error),
+            )
             return jsonify({"error": str(error)}), 413 if str(error) == "sunshine_payload_too_large" else 400
 
     @app.post("/internal/ingress/campaigns/<campaign_id>/messages:batch")
@@ -1947,14 +2248,20 @@ def create_app() -> Flask:
             return "", 200
         if request.method == "GET":
             return jsonify({"status": "ready"}), 200
-        secret_header = request.headers.get("X-API-Key") or request.headers.get("X-Sunshine-Secret") or ""
-        if secret_header and not sunshine_webhook_authorized(secret_header):
-            logger.warning("[SUNSHINE WEBHOOK] Unauthorized request rejected.")
+        secret_header = (
+            request.headers.get("X-Webhook-Token")
+            or request.headers.get("X-API-Key")
+            or request.headers.get("X-Sunshine-Secret")
+            or ""
+        )
+        if not secret_header or not sunshine_webhook_authorized(secret_header):
+            logger.warning("[SUNSHINE WEBHOOK UNAUTHORIZED] Rejecting unauthorized webhook request")
             return jsonify({"error": "webhook_unauthorized"}), 401
         body = request.get_json(silent=True)
         if not isinstance(body, dict):
             return jsonify({"error": "json_object_required"}), 400
         incoming = body.get("events") if isinstance(body.get("events"), list) else [body]
+        logger.info("[SUNSHINE WEBHOOK RECEIVED] events_count=%d", len(incoming))
         accepted = 0
         for event in incoming:
             if not isinstance(event, dict):
@@ -1972,7 +2279,7 @@ def create_app() -> Flask:
                 enqueue_task(EVENT_QUEUE, "/internal/tasks/event", {"event_id": event_id}, f"event-{event_id}")
                 accepted += 1
             except AlreadyExists:
-                pass
+                logger.info("[SUNSHINE WEBHOOK DUPLICATE] event_id=%s", event_id)
         return jsonify({"accepted": accepted, "duplicates": len(incoming) - accepted}), 202
 
     # Task routes
@@ -2184,6 +2491,10 @@ def task_sunshine():
     if not claim(db().transaction()):
         return jsonify({"status": "already_claimed"})
 
+    logger.info("[SUNSHINE TASK CLAIMED] message_id=%s", message_id)
+    logger.info("[SUNSHINE REQUEST START] message_id=%s", message_id)
+    start_time = time.monotonic()
+
     try:
         response = requests.post(
             f"{SUNSHINE_API_ROOT}/v1.1/apps/{SUNSHINE_APP_ID}/notifications",
@@ -2193,16 +2504,20 @@ def task_sunshine():
             timeout=(5, 10),
             allow_redirects=False,
         )
+        duration_ms = int((time.monotonic() - start_time) * 1000)
         if response.status_code == 429:
             attempt = int(message.get("retry_attempt", 0)) + 1
             delay = retry_delay(attempt, response.headers.get("Retry-After", ""))
+            logger.warning("[SUNSHINE RESPONSE] message_id=%s status=429 duration_ms=%d attempt=%d", message_id, duration_ms, attempt)
             ref.set({"status": "queued" if attempt < 12 else "failed", "retry_attempt": attempt}, merge=True)
             if attempt < 12:
                 enqueue_task(SUNSHINE_QUEUE, "/internal/tasks/sunshine", {"kind": "send", "message_id": message_id}, f"rate-retry-{message_id}-{attempt}", utcnow() + timedelta(seconds=delay))
             return jsonify({"status": "retry_scheduled" if attempt < 12 else "failed"})
         if response.status_code >= 500:
+            logger.warning("[SUNSHINE RESPONSE] message_id=%s status=%d duration_ms=%d ambiguous_provider_failure", message_id, response.status_code, duration_ms)
             raise requests.Timeout("ambiguous_provider_failure")
         if response.status_code == 423:
+            logger.warning("[SUNSHINE RESPONSE] message_id=%s status=423 duration_ms=%d conversation_locked", message_id, duration_ms)
             ref.set({"status": "conversation_locked", "error": "sunshine_423", "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
             locked_id = emit_event(message, "conversation_locked")
             enqueue_callback(message, locked_id, "conversation_locked", {"error": {"code": "sunshine_423", "message": "Conversation locked"}})
@@ -2212,7 +2527,11 @@ def task_sunshine():
                 provider_error = response.json().get("error") or {}
             except ValueError:
                 provider_error = {}
-            ref.set({"provider_error": {"code": safe_text(provider_error.get("code"), 100), "description": safe_text(provider_error.get("description"), 1000)}}, merge=True)
+            code = safe_text(provider_error.get("code"), 100)
+            desc = safe_text(provider_error.get("description"), 500)
+            logger.warning("[SUNSHINE RESPONSE] message_id=%s status=%d duration_ms=%d code=%s desc=%s", message_id, response.status_code, duration_ms, code or "-", desc or "-")
+            logger.warning("[SUNSHINE FAILED] message_id=%s status=%d code=%s", message_id, response.status_code, code or "-")
+            ref.set({"provider_error": {"code": code, "description": desc}}, merge=True)
             ref.set({"status": "failed", "error": f"sunshine_{response.status_code}", "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
             failure_id = emit_event(message, "failed", {"http_status": response.status_code})
             enqueue_callback(message, failure_id, "failed", {"error": {"code": f"sunshine_{response.status_code}", "message": "Sunshine rejected the notification"}})
@@ -2221,24 +2540,31 @@ def task_sunshine():
         try:
             result = response.json()
         except ValueError:
+            logger.warning("[SUNSHINE RESPONSE] message_id=%s status=%d invalid_json", message_id, response.status_code)
             raise requests.Timeout("invalid_accepted_response")
         if not isinstance(result, dict):
             raise requests.Timeout("invalid_accepted_response")
         notification_id = sunshine_notification_id(result)
         if not notification_id:
+            logger.warning("[SUNSHINE RESPONSE] message_id=%s missing notification_id", message_id)
             raise requests.Timeout("sunshine_missing_notification_id")
+
+        logger.info("[SUNSHINE RESPONSE] message_id=%s status=%d duration_ms=%d notification_id=%s", message_id, response.status_code, duration_ms, notification_id)
         ref.set({"status": "submitted", "notification_id": notification_id, "submitted_at": firestore.SERVER_TIMESTAMP, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
         db().collection(NOTIFICATION_INDEX).document(notification_id).set({"message_id": message_id, "expires_at": expires_at()})
         message["notification_id"] = notification_id
         submitted_event_id = emit_event(message, "submitted")
         enqueue_callback(message, submitted_event_id, "submitted")
+        logger.info("[SUNSHINE SUBMITTED] message_id=%s notification_id=%s", message_id, notification_id)
         return jsonify({"message_id": message_id, "notification_id": notification_id, "status": "submitted"})
     except requests.Timeout:
+        logger.warning("[SUNSHINE DELIVERY UNKNOWN] message_id=%s error=sunshine_timeout", message_id)
         ref.set({"status": "delivery_unknown", "error": "sunshine_timeout", "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
         unknown_id = emit_event(message, "delivery_unknown", {"code": "timeout_after_submit"})
         enqueue_callback(message, unknown_id, "delivery_unknown", {"error": {"code": "sunshine_timeout", "message": "Delivery result unknown after timeout"}})
         return jsonify({"status": "delivery_unknown"}), 200
-    except requests.RequestException:
+    except requests.RequestException as err:
+        logger.warning("[SUNSHINE DELIVERY UNKNOWN] message_id=%s error=sunshine_network_failure detail=%s", message_id, type(err).__name__)
         ref.set({"status": "delivery_unknown", "error": "sunshine_network_failure"}, merge=True)
         return jsonify({"status": "delivery_unknown"})
 
@@ -2264,16 +2590,19 @@ def task_event_handler(body: dict):
         return jsonify({"error": "event_not_found"}), 404
     stored = snapshot.to_dict() or {}
     if stored.get("processed_at"):
+        logger.info("[SUNSHINE WEBHOOK DUPLICATE] event_id=%s already_processed", event_id)
         return jsonify({"status": "already_processed"})
     event = stored.get("raw") or {}
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else event
     notification = payload.get("notification") if isinstance(payload.get("notification"), dict) else event.get("notification") or {}
     notification_id = str(notification.get("id") or notification.get("_id") or "")
     if not notification_id:
+        logger.info("[SUNSHINE WEBHOOK IGNORED] event_id=%s reason=missing_notification_id", event_id)
         event_ref.set({"processed_at": firestore.SERVER_TIMESTAMP, "result": "missing_notification_id"}, merge=True)
         return jsonify({"status": "ignored"})
     index = db().collection(NOTIFICATION_INDEX).document(notification_id).get()
     if not index.exists:
+        logger.warning("[SUNSHINE WEBHOOK PENDING] notification_id=%s index_pending", notification_id)
         return jsonify({"error": "notification_index_pending"}), 503
     message_ref = db().collection(MESSAGES).document(index.to_dict()["message_id"])
     message_snapshot = message_ref.get()
@@ -2292,6 +2621,7 @@ def task_event_handler(body: dict):
     }
     status = status_map.get(trigger)
     if not status:
+        logger.info("[SUNSHINE WEBHOOK IGNORED] event_id=%s trigger=%s reason=unsupported_trigger", event_id, trigger)
         event_ref.set({"processed_at": firestore.SERVER_TIMESTAMP, "result": "unsupported_trigger"}, merge=True)
         return jsonify({"status": "ignored"})
     update = {"status": status, "updated_at": firestore.SERVER_TIMESTAMP, "last_event_id": event_id}
@@ -2310,6 +2640,7 @@ def task_event_handler(body: dict):
         return True
 
     if not advance(db().transaction()):
+        logger.info("[SUNSHINE WEBHOOK IGNORED] event_id=%s notification_id=%s reason=ignored_after_final", event_id, notification_id)
         event_ref.set({"processed_at": firestore.SERVER_TIMESTAMP, "result": "ignored_after_final"}, merge=True)
         return jsonify({"status": "ignored_after_final"})
 
@@ -2318,6 +2649,14 @@ def task_event_handler(body: dict):
     if status == "user_delivered":
         enqueue_ticket(message, emitted_id)
     event_ref.set({"processed_at": firestore.SERVER_TIMESTAMP, "result": status, "message_id": message.get("message_id")}, merge=True)
+    logger.info(
+        "[SUNSHINE WEBHOOK PROCESSED] event_id=%s notification_id=%s trigger=%s previous_status=%s new_status=%s",
+        event_id,
+        notification_id,
+        trigger,
+        message.get("status"),
+        status,
+    )
     return jsonify({"status": status, "message_id": message.get("message_id")})
 
 
@@ -2422,15 +2761,19 @@ def task_zendesk_handler(body: dict):
     if not snapshot.exists:
         return jsonify({"error": "message_not_found"}), 404
     message = snapshot.to_dict() or {}
-    if message.get("ticket_id"):
-        return jsonify({"ticket_id": message["ticket_id"], "duplicate_task": True})
+    if message.get("ticket_updated_at") or (message.get("ticket_id") and not message.get("origin_ticket_id")):
+        return jsonify({"ticket_id": message.get("ticket_id"), "duplicate_task": True})
 
     message_content = resolve_message_content(message)
     campaign_name = (message.get("campaign") or {}).get("campaign_name") or message.get("campaign_id") or "WhatsApp"
+    recipient = message.get("recipient") or {}
+    masked_phone = mask_phone(recipient.get("phone"))
     comment_body = (
         f"WhatsApp entregado al usuario:\n\n"
         f"{message_content}\n\n"
         f"----------------------------------------\n"
+        f"Destinatario: {masked_phone}\n"
+        f"Plantilla: {message.get('template_name') or 'N/A'}\n"
         f"Campaña: {campaign_name}\n"
         f"Run: {message.get('run_id') or 'N/A'}\n"
         f"Notification ID: {message.get('notification_id') or 'N/A'}"
@@ -2452,6 +2795,7 @@ def task_zendesk_handler(body: dict):
         origin_ticket_id = message.get("source_reference")
 
     if origin_ticket_id:
+        logger.info("[ZENDESK TICKET UPDATE START] ticket_id=%s message_id=%s", origin_ticket_id, message_id)
         try:
             update_payload = {
                 "ticket": {
@@ -2459,7 +2803,7 @@ def task_zendesk_handler(body: dict):
                         "body": comment_body,
                         "public": False,
                     },
-                    "additional_tags": ["cerebro_sunshine", "sin_disparo_whatsapp"],
+                    "additional_tags": ["cerebro_sunshine", "sin_disparo_whatsapp", "whatsapp_entregado"],
                 }
             }
             update_resp = zendesk_request("PUT", f"/api/v2/tickets/{origin_ticket_id}.json", json=update_payload)
@@ -2469,9 +2813,17 @@ def task_zendesk_handler(body: dict):
                 message["ticket_id"] = tid
                 ev_id = emit_event(message, "zendesk_ticket_updated", {"ticket_id": tid})
                 enqueue_callback(message, ev_id, "zendesk_ticket_updated", {"ticket_id": tid})
+                logger.info("[ZENDESK TICKET UPDATED] ticket_id=%s message_id=%s", tid, message_id)
                 return jsonify({"ticket_id": tid, "updated": True})
-        except Exception as e:
-            logger.warning("No se pudo actualizar ticket origen %s, se creará uno nuevo: %s", origin_ticket_id, e)
+            else:
+                logger.warning("[ZENDESK TICKET UPDATE ERROR] ticket_id=%s message_id=%s non-200 response=%s", origin_ticket_id, message_id, update_resp.status_code)
+                return jsonify({"error": "zendesk_update_failed"}), 503
+        except requests.RequestException as exc:
+            logger.warning("[ZENDESK TICKET UPDATE ERROR] ticket_id=%s message_id=%s request_error=%s", origin_ticket_id, message_id, exc)
+            return jsonify({"error": "zendesk_temporary_failure"}), 503
+        except Exception as exc:
+            logger.warning("[ZENDESK TICKET UPDATE ERROR] ticket_id=%s message_id=%s unexpected_error=%s", origin_ticket_id, message_id, exc)
+            return jsonify({"error": "zendesk_update_exception"}), 500
 
     # 2. Si no viene ticket_id previo, crear un nuevo ticket resuelto para trazabilidad
     recipient = message.get("recipient") or {}

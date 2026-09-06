@@ -63,6 +63,7 @@ SUNSHINE_APP_ID = os.getenv("SUNSHINE_APP_ID", "")
 SUNSHINE_KEY_ID = os.getenv("SUNSHINE_KEY_ID", "")
 SUNSHINE_SECRET_KEY = os.getenv("SUNSHINE_SECRET_KEY", "")
 SUNSHINE_WEBHOOK_SECRET = os.getenv("SUNSHINE_WEBHOOK_SECRET", "")
+SUNSHINE_WEBHOOK_TOKEN = os.getenv("SUNSHINE_WEBHOOK_TOKEN", "") or SUNSHINE_WEBHOOK_SECRET
 SUNSHINE_INTEGRATION_ID = os.getenv("SUNSHINE_INTEGRATION_ID", "")
 SUNSHINE_NAMESPACE = os.getenv("SUNSHINE_TEMPLATE_NAMESPACE", "")
 SUNSHINE_JSON_LIMIT = int(os.getenv("SUNSHINE_JSON_LIMIT_BYTES", "95000"))
@@ -133,6 +134,42 @@ def normalize_email(value: Any) -> str | None:
     if not EMAIL_RE.fullmatch(email):
         raise ValueError("invalid_email")
     return email
+
+
+def mask_phone(phone: Any) -> str:
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if len(digits) >= 4:
+        return f"***{digits[-4:]}"
+    return "***"
+
+
+def normalize_ticket_id(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if not s.isdigit() or int(s) <= 0:
+        raise ValueError("invalid_ticket_id")
+    return int(s)
+
+
+def normalize_https_url(value: Any) -> str:
+    s = str(value or "").strip()
+    if not s:
+        raise ValueError("invalid_image_url")
+    if len(s) > 2048:
+        raise ValueError("invalid_image_url")
+    if "[" in s or "]" in s or "(" in s or ")" in s:
+        raise ValueError("invalid_image_url")
+    parsed = urlparse(s)
+    if parsed.scheme.lower() != "https" or not parsed.netloc or not parsed.hostname:
+        raise ValueError("invalid_image_url")
+    if parsed.username or parsed.password:
+        raise ValueError("invalid_image_url")
+    if parsed.port not in (None, 443):
+        raise ValueError("invalid_image_url")
+    return s
 
 
 def safe_text(value: Any, maximum: int = 500) -> str:

@@ -1,6 +1,7 @@
 """Ingress routes protected by Gateway mutual authentication."""
 from __future__ import annotations
 
+import logging
 from flask import Blueprint, jsonify, request
 from google.cloud import firestore
 from google.api_core.exceptions import AlreadyExists
@@ -12,6 +13,7 @@ from services.batch_service import save_incoming_batch
 from services.reporting_service import run_report, schedule_report
 from clients.sunshine import sunshine_webhook_authorized
 
+logger = logging.getLogger(__name__)
 ingress_bp = Blueprint("ingress", __name__)
 
 
@@ -32,6 +34,18 @@ def ingress_notifications():
     raw = request.get_json(silent=True)
     if not isinstance(raw, dict):
         return jsonify({"error": "json_object_required"}), 400
+    request_id = request.headers.get("X-Request-Id") or config.doc_id(config.utcnow().isoformat())[:12]
+    raw_dest = raw.get("destination") or {}
+    raw_phone = raw_dest.get("destinationId") or raw.get("phone") or ""
+    raw_tmpl = ((raw.get("message") or {}).get("template") or {}).get("name") or "-"
+    raw_tid = raw.get("ticket_id") or ((raw.get("metadata") or {}).get("ticket_id")) or "-"
+    logger.info(
+        "[SUNSHINE INGRESS START] request_id=%s ticket_id=%s phone=%s template=%s",
+        request_id,
+        raw_tid,
+        config.mask_phone(raw_phone),
+        raw_tmpl,
+    )
     try:
         payload, recipient = sanitize_legacy_payload(raw, config.SUNSHINE_APP_ID)
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
@@ -62,12 +76,25 @@ def ingress_notifications():
             campaign=campaign,
             source_channel="zendesk_trigger",
         )
+        wire = canonical_json(payload)
+        logger.info(
+            "[SUNSHINE PAYLOAD BUILT] request_id=%s message_id=%s bytes=%d payload_hash=%s",
+            request_id,
+            message["message_id"],
+            len(wire),
+            config.doc_id(wire)[:12],
+        )
         return jsonify({
             "message_id": message["message_id"],
             "status": message.get("status"),
             "duplicate": duplicate,
         }), 200 if duplicate else 202
     except ValueError as error:
+        logger.warning(
+            "[SUNSHINE INGRESS REJECTED] request_id=%s error=%s",
+            request_id,
+            str(error),
+        )
         return jsonify({"error": str(error)}), 413 if str(error) == "sunshine_payload_too_large" else 400
 
 
@@ -77,6 +104,19 @@ def ingress_legacy(app_id: str):
     raw = request.get_json(silent=True)
     if not isinstance(raw, dict):
         return jsonify({"error": "json_object_required"}), 400
+    request_id = request.headers.get("X-Request-Id") or config.doc_id(config.utcnow().isoformat())[:12]
+    raw_dest = raw.get("destination") or {}
+    raw_phone = raw_dest.get("destinationId") or raw.get("phone") or ""
+    raw_tmpl = ((raw.get("message") or {}).get("template") or {}).get("name") or "-"
+    raw_tid = raw.get("ticket_id") or ((raw.get("metadata") or {}).get("ticket_id")) or "-"
+    logger.info(
+        "[SUNSHINE INGRESS START] request_id=%s app_id=%s ticket_id=%s phone=%s template=%s",
+        request_id,
+        app_id,
+        raw_tid,
+        config.mask_phone(raw_phone),
+        raw_tmpl,
+    )
     try:
         payload, recipient = sanitize_legacy_payload(raw, app_id)
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
@@ -107,12 +147,25 @@ def ingress_legacy(app_id: str):
             campaign=campaign,
             source_channel="zendesk_legacy",
         )
+        wire = canonical_json(payload)
+        logger.info(
+            "[SUNSHINE PAYLOAD BUILT] request_id=%s message_id=%s bytes=%d payload_hash=%s",
+            request_id,
+            message["message_id"],
+            len(wire),
+            config.doc_id(wire)[:12],
+        )
         return jsonify({
             "message_id": message["message_id"],
             "status": message.get("status"),
             "duplicate": duplicate,
         }), 200 if duplicate else 202
     except ValueError as error:
+        logger.warning(
+            "[SUNSHINE INGRESS REJECTED] request_id=%s error=%s",
+            request_id,
+            str(error),
+        )
         return jsonify({"error": str(error)}), 413 if str(error) == "sunshine_payload_too_large" else 400
 
 
@@ -192,13 +245,20 @@ def ingress_sunshine_webhook():
         return "", 200
     if request.method == "GET":
         return jsonify({"status": "ready"}), 200
-    secret_header = request.headers.get("X-API-Key") or request.headers.get("X-Sunshine-Secret") or ""
-    if secret_header and not sunshine_webhook_authorized(secret_header):
+    secret_header = (
+        request.headers.get("X-Webhook-Token")
+        or request.headers.get("X-API-Key")
+        or request.headers.get("X-Sunshine-Secret")
+        or ""
+    )
+    if not secret_header or not sunshine_webhook_authorized(secret_header):
+        logger.warning("[SUNSHINE WEBHOOK UNAUTHORIZED] Rejecting unauthorized webhook request")
         return jsonify({"error": "webhook_unauthorized"}), 401
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify({"error": "json_object_required"}), 400
     incoming = body.get("events") if isinstance(body.get("events"), list) else [body]
+    logger.info("[SUNSHINE WEBHOOK RECEIVED] events_count=%d", len(incoming))
     accepted = 0
     for event in incoming:
         if not isinstance(event, dict):
@@ -221,5 +281,5 @@ def ingress_sunshine_webhook():
             )
             accepted += 1
         except AlreadyExists:
-            pass
+            logger.info("[SUNSHINE WEBHOOK DUPLICATE] event_id=%s", event_id)
     return jsonify({"accepted": accepted, "duplicates": len(incoming) - accepted}), 202
