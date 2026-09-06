@@ -15,9 +15,23 @@ LOCAL_DEV = os.getenv("LOCAL_DEV", "false").lower() == "true"
 PORT = int(os.getenv("PORT", "8080"))
 CORE_MAX_BODY_BYTES = int(os.getenv("CORE_MAX_BODY_BYTES", "5242880"))
 
-PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT_ID", "")
+def resolve_project_id() -> str:
+    pid = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT_ID")
+    if pid:
+        return pid
+    try:
+        import google.auth
+        _, default_pid = google.auth.default()
+        if default_pid:
+            return default_pid
+    except Exception:
+        pass
+    return "dreams-reservas-nacional"
+
+
+PROJECT_ID = resolve_project_id()
 REGION = os.getenv("GCP_REGION", "southamerica-west1")
-TASKS_LOCATION = os.getenv("CLOUD_TASKS_LOCATION", os.getenv("TASKS_LOCATION", "us-central1"))
+TASKS_LOCATION = os.getenv("CLOUD_TASKS_LOCATION") or os.getenv("TASKS_LOCATION") or os.getenv("GCP_REGION") or "southamerica-west1"
 FIRESTORE_DATABASE = os.getenv("FIRESTORE_DATABASE", "cerebro-sunshine")
 TTL_DAYS = int(os.getenv("FIRESTORE_TTL_DAYS", "3"))
 BATCH_TTL_DAYS = int(os.getenv("BATCH_TTL_DAYS", "1"))  # 1 day TTL for incoming raw batches

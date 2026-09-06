@@ -46,9 +46,23 @@ LOCAL_DEV = os.getenv("LOCAL_DEV", "false").lower() == "true"
 PORT = int(os.getenv("PORT", "8080"))
 CORE_MAX_BODY_BYTES = int(os.getenv("CORE_MAX_BODY_BYTES", "5242880"))
 
-PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT_ID", "")
+def resolve_project_id() -> str:
+    pid = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT_ID")
+    if pid:
+        return pid
+    try:
+        import google.auth
+        _, default_pid = google.auth.default()
+        if default_pid:
+            return default_pid
+    except Exception:
+        pass
+    return "dreams-reservas-nacional"
+
+
+PROJECT_ID = resolve_project_id()
 REGION = os.getenv("GCP_REGION", "southamerica-west1")
-TASKS_LOCATION = os.getenv("CLOUD_TASKS_LOCATION", os.getenv("TASKS_LOCATION", "us-central1"))
+TASKS_LOCATION = os.getenv("CLOUD_TASKS_LOCATION") or os.getenv("TASKS_LOCATION") or os.getenv("GCP_REGION") or "southamerica-west1"
 FIRESTORE_DATABASE = os.getenv("FIRESTORE_DATABASE", "cerebro-sunshine")
 TTL_DAYS = int(os.getenv("FIRESTORE_TTL_DAYS", "3"))
 BATCH_TTL_DAYS = int(os.getenv("BATCH_TTL_DAYS", "1"))
@@ -264,8 +278,10 @@ def enqueue_task(queue: str, path: str, payload: dict, task_key: str, schedule_a
         client = tasks_client()
         if client is None:
             return False
-        parent = client.queue_path(PROJECT_ID, TASKS_LOCATION, queue)
-        task_name = client.task_path(PROJECT_ID, TASKS_LOCATION, queue, doc_id(queue, task_key)[:40])
+        project_id = PROJECT_ID or resolve_project_id()
+        tasks_location = TASKS_LOCATION or REGION or "southamerica-west1"
+        parent = client.queue_path(project_id, tasks_location, queue)
+        task_name = client.task_path(project_id, tasks_location, queue, doc_id(queue, task_key)[:40])
         sa_email = TASK_INVOKER_SERVICE_ACCOUNT or "462948619262-compute@developer.gserviceaccount.com"
         audience = TASK_OIDC_AUDIENCE or SERVICE_URL or "https://cerebro-sunshine-462948619262.southamerica-west1.run.app"
         task = {

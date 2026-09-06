@@ -75,8 +75,10 @@ def enqueue_task(queue: str, path: str, payload: dict, task_key: str, schedule_a
         client = tasks_client()
         if client is None:
             return False
-        parent = client.queue_path(config.PROJECT_ID, config.TASKS_LOCATION, queue)
-        task_name = client.task_path(config.PROJECT_ID, config.TASKS_LOCATION, queue, config.doc_id(queue, task_key)[:40])
+        project_id = config.PROJECT_ID or config.resolve_project_id()
+        tasks_location = config.TASKS_LOCATION or config.REGION or "southamerica-west1"
+        parent = client.queue_path(project_id, tasks_location, queue)
+        task_name = client.task_path(project_id, tasks_location, queue, config.doc_id(queue, task_key)[:40])
         sa_email = config.TASK_INVOKER_SERVICE_ACCOUNT or "462948619262-compute@developer.gserviceaccount.com"
         audience = config.TASK_OIDC_AUDIENCE or config.SERVICE_URL or "https://cerebro-sunshine-462948619262.southamerica-west1.run.app"
         task = {
