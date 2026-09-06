@@ -2387,10 +2387,12 @@ def task_analytics_handler(body: dict):
         "details_json": serialize(event.get("details") or {}),
     }
     if bq_client() is not None:
-        errors = bq_client().insert_rows_json(f"{PROJECT_ID}.{BIGQUERY_DATASET}.{BIGQUERY_EVENTS_TABLE}", [row], row_ids=[event_id])
-        if errors:
-            logger.error("BigQuery insert failed: %s", errors)
-            return jsonify({"error": "bigquery_insert_failed"}), 503
+        try:
+            errors = bq_client().insert_rows_json(f"{PROJECT_ID}.{BIGQUERY_DATASET}.{BIGQUERY_EVENTS_TABLE}", [row], row_ids=[event_id])
+            if errors:
+                logger.warning("BigQuery insert failed: %s", errors)
+        except Exception as bq_err:
+            logger.warning("BigQuery analytics export skipped: %s", bq_err)
     snapshot.reference.set({"exported_at": firestore.SERVER_TIMESTAMP}, merge=True)
     return jsonify({"status": "exported", "event_id": event_id})
 

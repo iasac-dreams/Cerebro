@@ -27,13 +27,16 @@ def handle_analytics_task(body: dict):
         "event_at": config.serialize(event.get("event_at") or config.utcnow()),
         "details_json": config.serialize(event.get("details") or {}),
     }
-    errors = bq_client().insert_rows_json(
-        f"{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.{config.BIGQUERY_EVENTS_TABLE}",
-        [row],
-        row_ids=[event_id],
-    )
-    if errors:
-        logger.error("BigQuery insert failed: %s", errors)
-        return jsonify({"error": "bigquery_insert_failed"}), 503
+    if bq_client() is not None:
+        try:
+            errors = bq_client().insert_rows_json(
+                f"{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.{config.BIGQUERY_EVENTS_TABLE}",
+                [row],
+                row_ids=[event_id],
+            )
+            if errors:
+                logger.warning("BigQuery insert failed: %s", errors)
+        except Exception as bq_err:
+            logger.warning("BigQuery analytics export skipped: %s", bq_err)
     snapshot.reference.set({"exported_at": firestore.SERVER_TIMESTAMP}, merge=True)
     return jsonify({"status": "exported", "event_id": event_id})
