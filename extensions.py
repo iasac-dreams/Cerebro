@@ -39,7 +39,7 @@ def tasks_client() -> tasks_v2.CloudTasksClient:
 def bq_client() -> bigquery.Client:
     global _bq
     if _bq is None:
-        _bq = bigquery.Client(project=config.PROJECT_ID or None)
+        _bq = bigquery.Client(project=config.PROJECT_ID or None, location=config.REGION)
     return _bq
 
 

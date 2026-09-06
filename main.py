@@ -157,7 +157,7 @@ def tasks_client() -> tasks_v2.CloudTasksClient:
 def bq_client() -> Any:
     global _bq
     if _bq is None and bigquery is not None:
-        _bq = bigquery.Client(project=PROJECT_ID or None)
+        _bq = bigquery.Client(project=PROJECT_ID or None, location=REGION)
     return _bq
 
 
@@ -1429,23 +1429,27 @@ def create_app() -> Flask:
         result = unpack_batch_chunk(chunk_id)
         return jsonify(result), 200
 
-    # Admin routes
     @app.get("/internal/admin/metrics")
     @require_gateway
     @require_actor("dashboard:read")
     def admin_metrics():
         days = max(1, min(int(request.args.get("days", "7")), 90))
-        if bq_client() is None:
+        client = bq_client()
+        if client is None:
             return jsonify({"days": days, "series": []})
-        query = f"""
-            SELECT DATE(event_at) AS day, status, COUNT(*) AS total
-            FROM `{PROJECT_ID}.{BIGQUERY_DATASET}.{BIGQUERY_EVENTS_TABLE}`
-            WHERE event_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
-            GROUP BY day, status ORDER BY day DESC, status
-        """
-        job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("days", "INT64", days)])
-        rows = [{"day": str(row.day), "status": row.status, "total": row.total} for row in bq_client().query(query, job_config=job_config).result()]
-        return jsonify({"days": days, "series": rows})
+        try:
+            query = f"""
+                SELECT DATE(event_at) AS day, status, COUNT(*) AS total
+                FROM `{PROJECT_ID}.{BIGQUERY_DATASET}.{BIGQUERY_EVENTS_TABLE}`
+                WHERE event_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+                GROUP BY day, status ORDER BY day DESC, status
+            """
+            job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("days", "INT64", days)])
+            rows = [{"day": str(row.day), "status": row.status, "total": row.total} for row in client.query(query, job_config=job_config, location=REGION).result()]
+            return jsonify({"days": days, "series": rows})
+        except Exception as err:
+            logger.warning("BigQuery metrics query error: %s", err)
+            return jsonify({"days": days, "series": []})
 
     @app.get("/internal/admin/runs")
     @require_gateway
