@@ -25,6 +25,51 @@ def ingress_templates():
     return jsonify({"templates": items, "cached": True})
 
 
+@ingress_bp.post("/notifications")
+@require_gateway
+def ingress_notifications():
+    raw = request.get_json(silent=True)
+    if not isinstance(raw, dict):
+        return jsonify({"error": "json_object_required"}), 400
+    try:
+        payload, recipient = sanitize_legacy_payload(raw, config.SUNSHINE_APP_ID)
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        ticket_id = recipient.get("ticket_id")
+        source_reference = config.safe_text(
+            str(ticket_id) if ticket_id else (metadata.get("source_reference") or recipient["external_id"]),
+            200,
+        )
+        idempotency_key = config.safe_text(metadata.get("idempotency_key") or config.doc_id(canonical_json(payload)), 200)
+        now_key = config.utcnow().strftime("%Y%m%d")
+        campaign = {
+            "campaign_name": config.safe_text(metadata.get("campaign_name") or "Zendesk Trigger", 200),
+            "zendesk": {
+                "create_ticket_on": "delivered",
+                "subject": "WhatsApp entregado - {name}",
+                "tags": ["cerebro_sunshine", "sin_disparo_whatsapp"],
+            },
+        }
+        if ticket_id:
+            campaign["zendesk"]["ticket_id"] = ticket_id
+        message, duplicate = store_message(
+            campaign_id="zendesk-trigger",
+            run_id=f"zendesk-trigger-{now_key}",
+            idempotency_key=idempotency_key,
+            source_reference=source_reference,
+            payload=payload,
+            recipient=recipient,
+            campaign=campaign,
+            source_channel="zendesk_trigger",
+        )
+        return jsonify({
+            "message_id": message["message_id"],
+            "status": message.get("status"),
+            "duplicate": duplicate,
+        }), 200 if duplicate else 202
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 413 if str(error) == "sunshine_payload_too_large" else 400
+
+
 @ingress_bp.post("/legacy/apps/<app_id>/notifications")
 @require_gateway
 def ingress_legacy(app_id: str):

@@ -45,17 +45,19 @@ def legacy_body_values(message: dict) -> list[str]:
     return []
 
 
-def sanitize_legacy_payload(raw: dict, app_id: str) -> tuple[dict, dict]:
-    if app_id != config.SUNSHINE_APP_ID:
+def sanitize_legacy_payload(raw: dict, app_id: str | None = None) -> tuple[dict, dict]:
+    app_id = app_id or config.SUNSHINE_APP_ID
+    if config.SUNSHINE_APP_ID and app_id != config.SUNSHINE_APP_ID:
         raise ValueError("unknown_sunshine_app")
     destination = raw.get("destination") if isinstance(raw.get("destination"), dict) else {}
     message = raw.get("message") if isinstance(raw.get("message"), dict) else {}
     if not message:
         raise ValueError("message_required")
     integration_id = config.safe_text(destination.get("integrationId") or config.SUNSHINE_INTEGRATION_ID, 200)
-    if integration_id != config.SUNSHINE_INTEGRATION_ID:
+    if config.SUNSHINE_INTEGRATION_ID and integration_id and integration_id != config.SUNSHINE_INTEGRATION_ID:
         raise ValueError("unknown_sunshine_integration")
-    phone = config.normalize_phone(destination.get("destinationId"))
+    phone_raw = destination.get("destinationId") or raw.get("phone") or raw.get("destinationId")
+    phone = config.normalize_phone(phone_raw)
     payload = {
         "destination": {"integrationId": integration_id, "destinationId": phone},
         "author": {"role": "appMaker"},
@@ -63,6 +65,8 @@ def sanitize_legacy_payload(raw: dict, app_id: str) -> tuple[dict, dict]:
     }
     if raw.get("messageSchema"):
         payload["messageSchema"] = config.safe_text(raw.get("messageSchema"), 30)
+    else:
+        payload["messageSchema"] = "whatsapp"
     if isinstance(raw.get("metadata"), dict):
         payload["metadata"] = raw["metadata"]
     sunshine_wire_payload(payload)

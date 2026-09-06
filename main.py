@@ -732,17 +732,19 @@ def legacy_body_values(message: dict) -> list[str]:
     return []
 
 
-def sanitize_legacy_payload(raw: dict, app_id: str) -> tuple[dict, dict]:
-    if app_id != SUNSHINE_APP_ID:
+def sanitize_legacy_payload(raw: dict, app_id: str | None = None) -> tuple[dict, dict]:
+    app_id = app_id or SUNSHINE_APP_ID
+    if SUNSHINE_APP_ID and app_id != SUNSHINE_APP_ID:
         raise ValueError("unknown_sunshine_app")
     destination = raw.get("destination") if isinstance(raw.get("destination"), dict) else {}
     message = raw.get("message") if isinstance(raw.get("message"), dict) else {}
     if not message:
         raise ValueError("message_required")
     integration_id = safe_text(destination.get("integrationId") or SUNSHINE_INTEGRATION_ID, 200)
-    if integration_id != SUNSHINE_INTEGRATION_ID:
+    if SUNSHINE_INTEGRATION_ID and integration_id and integration_id != SUNSHINE_INTEGRATION_ID:
         raise ValueError("unknown_sunshine_integration")
-    phone = normalize_phone(destination.get("destinationId"))
+    phone_raw = destination.get("destinationId") or raw.get("phone") or raw.get("destinationId")
+    phone = normalize_phone(phone_raw)
     payload = {
         "destination": {"integrationId": integration_id, "destinationId": phone},
         "author": {"role": "appMaker"},
@@ -750,6 +752,8 @@ def sanitize_legacy_payload(raw: dict, app_id: str) -> tuple[dict, dict]:
     }
     if raw.get("messageSchema"):
         payload["messageSchema"] = safe_text(raw.get("messageSchema"), 30)
+    else:
+        payload["messageSchema"] = "whatsapp"
     if isinstance(raw.get("metadata"), dict):
         payload["metadata"] = raw["metadata"]
     sunshine_wire_payload(payload)
@@ -1630,6 +1634,50 @@ def create_app() -> Flask:
             item.pop("raw", None)
             items.append(item)
         return jsonify({"templates": items, "cached": True})
+
+    @app.post("/internal/ingress/notifications")
+    @require_gateway
+    def ingress_notifications():
+        raw = request.get_json(silent=True)
+        if not isinstance(raw, dict):
+            return jsonify({"error": "json_object_required"}), 400
+        try:
+            payload, recipient = sanitize_legacy_payload(raw, SUNSHINE_APP_ID)
+            metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+            ticket_id = recipient.get("ticket_id")
+            source_reference = safe_text(
+                str(ticket_id) if ticket_id else (metadata.get("source_reference") or recipient["external_id"]),
+                200,
+            )
+            idempotency_key = safe_text(metadata.get("idempotency_key") or doc_id(canonical_json(payload)), 200)
+            now_key = utcnow().strftime("%Y%m%d")
+            campaign = {
+                "campaign_name": safe_text(metadata.get("campaign_name") or "Zendesk Trigger", 200),
+                "zendesk": {
+                    "create_ticket_on": "delivered",
+                    "subject": "WhatsApp entregado - {name}",
+                    "tags": ["cerebro_sunshine", "sin_disparo_whatsapp"],
+                },
+            }
+            if ticket_id:
+                campaign["zendesk"]["ticket_id"] = ticket_id
+            message, duplicate = store_message(
+                campaign_id="zendesk-trigger",
+                run_id=f"zendesk-trigger-{now_key}",
+                idempotency_key=idempotency_key,
+                source_reference=source_reference,
+                payload=payload,
+                recipient=recipient,
+                campaign=campaign,
+                source_channel="zendesk_trigger",
+            )
+            return jsonify({
+                "message_id": message["message_id"],
+                "status": message.get("status"),
+                "duplicate": duplicate,
+            }), 200 if duplicate else 202
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 413 if str(error) == "sunshine_payload_too_large" else 400
 
     @app.post("/internal/ingress/legacy/apps/<app_id>/notifications")
     @require_gateway
