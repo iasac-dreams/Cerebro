@@ -13,8 +13,17 @@ from extensions import db, bq_client, enqueue_task
 from security.decorators import require_gateway
 from security.actors import require_actor
 from services.reporting_service import run_report
+from services.analytics_service import get_whatsapp_analytics
 
 admin_bp = Blueprint("admin", __name__)
+
+
+@admin_bp.get("/analytics")
+@require_gateway
+@require_actor("dashboard:read")
+def admin_analytics():
+    days = max(1, min(int(request.args.get("days", "30")), 90))
+    return jsonify(get_whatsapp_analytics(days))
 
 
 @admin_bp.get("/metrics")
