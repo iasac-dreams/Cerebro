@@ -17,6 +17,7 @@ CORE_MAX_BODY_BYTES = int(os.getenv("CORE_MAX_BODY_BYTES", "5242880"))
 
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT_ID", "")
 REGION = os.getenv("GCP_REGION", "southamerica-west1")
+TASKS_LOCATION = os.getenv("CLOUD_TASKS_LOCATION", os.getenv("TASKS_LOCATION", "us-central1"))
 FIRESTORE_DATABASE = os.getenv("FIRESTORE_DATABASE", "cerebro-sunshine")
 TTL_DAYS = int(os.getenv("FIRESTORE_TTL_DAYS", "3"))
 BATCH_TTL_DAYS = int(os.getenv("BATCH_TTL_DAYS", "1"))  # 1 day TTL for incoming raw batches

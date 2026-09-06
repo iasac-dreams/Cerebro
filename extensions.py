@@ -65,8 +65,8 @@ def canonical_json(value: Any) -> bytes:
 def enqueue_task(queue: str, path: str, payload: dict, task_key: str, schedule_at: datetime | None = None) -> bool:
     """Enqueues an HTTP task to Cloud Tasks with OIDC service account authentication."""
     client = tasks_client()
-    parent = client.queue_path(config.PROJECT_ID, config.REGION, queue)
-    task_name = client.task_path(config.PROJECT_ID, config.REGION, queue, config.doc_id(queue, task_key)[:40])
+    parent = client.queue_path(config.PROJECT_ID, config.TASKS_LOCATION, queue)
+    task_name = client.task_path(config.PROJECT_ID, config.TASKS_LOCATION, queue, config.doc_id(queue, task_key)[:40])
     task = {
         "name": task_name,
         "http_request": {
