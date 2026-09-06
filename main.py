@@ -241,9 +241,8 @@ def retry_delay(attempt: int, retry_after: str = "") -> float:
 
 
 def task_url(path: str) -> str:
-    if not SERVICE_URL:
-        raise RuntimeError("SERVICE_URL is required")
-    return f"{SERVICE_URL}{path}"
+    base = SERVICE_URL or os.getenv("CORE_SERVICE_URL") or "https://cerebro-sunshine-462948619262.southamerica-west1.run.app"
+    return f"{base.rstrip('/')}{path}"
 
 
 def serialize(value: Any) -> Any:
@@ -257,33 +256,40 @@ def serialize(value: Any) -> Any:
 
 
 def enqueue_task(queue: str, path: str, payload: dict, task_key: str, schedule_at: datetime | None = None) -> bool:
-    client = tasks_client()
-    parent = client.queue_path(PROJECT_ID, TASKS_LOCATION, queue)
-    task_name = client.task_path(PROJECT_ID, TASKS_LOCATION, queue, doc_id(queue, task_key)[:40])
-    task = {
-        "name": task_name,
-        "http_request": {
-            "http_method": tasks_v2.HttpMethod.POST,
-            "url": task_url(path),
-            "headers": {
-                "Content-Type": "application/json",
-                "X-Cerebro-Task-Secret": TASK_SHARED_SECRET,
-            },
-            "body": canonical_json(payload),
-            "oidc_token": {
-                "service_account_email": TASK_INVOKER_SERVICE_ACCOUNT,
-                "audience": TASK_OIDC_AUDIENCE,
-            },
-        },
-    }
-    if schedule_at:
-        stamp = timestamp_pb2.Timestamp()
-        stamp.FromDatetime(schedule_at)
-        task["schedule_time"] = stamp
     try:
+        client = tasks_client()
+        if client is None:
+            return False
+        parent = client.queue_path(PROJECT_ID, TASKS_LOCATION, queue)
+        task_name = client.task_path(PROJECT_ID, TASKS_LOCATION, queue, doc_id(queue, task_key)[:40])
+        sa_email = TASK_INVOKER_SERVICE_ACCOUNT or "462948619262-compute@developer.gserviceaccount.com"
+        audience = TASK_OIDC_AUDIENCE or SERVICE_URL or "https://cerebro-sunshine-462948619262.southamerica-west1.run.app"
+        task = {
+            "name": task_name,
+            "http_request": {
+                "http_method": tasks_v2.HttpMethod.POST,
+                "url": task_url(path),
+                "headers": {
+                    "Content-Type": "application/json",
+                    "X-Cerebro-Task-Secret": TASK_SHARED_SECRET,
+                },
+                "body": canonical_json(payload),
+                "oidc_token": {
+                    "service_account_email": sa_email,
+                    "audience": audience,
+                },
+            },
+        }
+        if schedule_at:
+            stamp = timestamp_pb2.Timestamp()
+            stamp.FromDatetime(schedule_at)
+            task["schedule_time"] = stamp
         client.create_task(request={"parent": parent, "task": task})
         return True
     except AlreadyExists:
+        return False
+    except Exception as err:
+        logger.error("Failed to enqueue task in queue '%s': %s", queue, err)
         return False
 
 
@@ -1494,13 +1500,32 @@ def create_app() -> Flask:
     @require_gateway
     @require_actor("runs:retry")
     def admin_template_sync():
+        meta_synced = False
+        meta_count = 0
+        meta_error = None
+        if META_WABA_ID and META_SYSTEM_TOKEN:
+            try:
+                res = sync_meta_templates()
+                sync_meta_namespace()
+                meta_synced = True
+                meta_count = res.get("templates", 0)
+            except Exception as e:
+                meta_error = str(e)
+                logger.error("Direct Meta sync failed: %s", e)
+
         hour_key = str(int(time.time()) // 7200)
-        created = {
+        tasks = {
             "sunshine": enqueue_task(SUNSHINE_QUEUE, "/internal/tasks/sunshine", {"kind": "sync_templates"}, f"templates-{hour_key}"),
             "meta_templates": enqueue_task(META_QUEUE, "/internal/tasks/meta", {"kind": "sync_templates"}, f"meta-templates-{hour_key}"),
             "meta_namespace": enqueue_task(META_QUEUE, "/internal/tasks/meta", {"kind": "sync_namespace"}, f"meta-namespace-{hour_key}"),
         }
-        return jsonify({"status": "queued" if any(created.values()) else "already_queued", "tasks": created}), 202
+        status = "synced" if meta_synced else ("queued" if any(tasks.values()) else ("failed" if meta_error else "already_queued"))
+        return jsonify({
+            "status": status,
+            "meta_templates_synced": meta_count,
+            "meta_error": meta_error,
+            "tasks": tasks,
+        }), 200
 
     @app.errorhandler(413)
     def too_large(_error):

@@ -159,9 +159,8 @@ def retry_delay(attempt: int, retry_after: str = "") -> float:
 
 
 def task_url(path: str) -> str:
-    if not SERVICE_URL:
-        raise RuntimeError("SERVICE_URL is required")
-    return f"{SERVICE_URL}{path}"
+    base = SERVICE_URL or os.getenv("CORE_SERVICE_URL") or "https://cerebro-sunshine-462948619262.southamerica-west1.run.app"
+    return f"{base.rstrip('/')}{path}"
 
 
 def serialize(value: Any) -> Any:

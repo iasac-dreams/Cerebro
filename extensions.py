@@ -64,31 +64,37 @@ def canonical_json(value: Any) -> bytes:
 
 def enqueue_task(queue: str, path: str, payload: dict, task_key: str, schedule_at: datetime | None = None) -> bool:
     """Enqueues an HTTP task to Cloud Tasks with OIDC service account authentication."""
-    client = tasks_client()
-    parent = client.queue_path(config.PROJECT_ID, config.TASKS_LOCATION, queue)
-    task_name = client.task_path(config.PROJECT_ID, config.TASKS_LOCATION, queue, config.doc_id(queue, task_key)[:40])
-    task = {
-        "name": task_name,
-        "http_request": {
-            "http_method": tasks_v2.HttpMethod.POST,
-            "url": config.task_url(path),
-            "headers": {
-                "Content-Type": "application/json",
-                "X-Cerebro-Task-Secret": config.TASK_SHARED_SECRET,
-            },
-            "body": canonical_json(payload),
-            "oidc_token": {
-                "service_account_email": config.TASK_INVOKER_SERVICE_ACCOUNT,
-                "audience": config.TASK_OIDC_AUDIENCE,
-            },
-        },
-    }
-    if schedule_at:
-        stamp = timestamp_pb2.Timestamp()
-        stamp.FromDatetime(schedule_at)
-        task["schedule_time"] = stamp
     try:
+        client = tasks_client()
+        if client is None:
+            return False
+        parent = client.queue_path(config.PROJECT_ID, config.TASKS_LOCATION, queue)
+        task_name = client.task_path(config.PROJECT_ID, config.TASKS_LOCATION, queue, config.doc_id(queue, task_key)[:40])
+        sa_email = config.TASK_INVOKER_SERVICE_ACCOUNT or "462948619262-compute@developer.gserviceaccount.com"
+        audience = config.TASK_OIDC_AUDIENCE or config.SERVICE_URL or "https://cerebro-sunshine-462948619262.southamerica-west1.run.app"
+        task = {
+            "name": task_name,
+            "http_request": {
+                "http_method": tasks_v2.HttpMethod.POST,
+                "url": config.task_url(path),
+                "headers": {
+                    "Content-Type": "application/json",
+                    "X-Cerebro-Task-Secret": config.TASK_SHARED_SECRET,
+                },
+                "body": canonical_json(payload),
+                "oidc_token": {
+                    "service_account_email": sa_email,
+                    "audience": audience,
+                },
+            },
+        }
+        if schedule_at:
+            stamp = timestamp_pb2.Timestamp()
+            stamp.FromDatetime(schedule_at)
+            task["schedule_time"] = stamp
         client.create_task(request={"parent": parent, "task": task})
         return True
     except AlreadyExists:
+        return False
+    except Exception:
         return False
