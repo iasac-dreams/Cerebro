@@ -83,3 +83,16 @@ def create_solved_ticket(ticket_payload: dict) -> int:
     )
     response.raise_for_status()
     return response.json()["ticket"]["id"]
+
+
+def update_ticket_internal_note(ticket_id: int | str, body: str, tags: list[str] | None = None) -> bool:
+    payload = {
+        "ticket": {
+            "comment": {"body": body, "public": False},
+        }
+    }
+    if tags:
+        payload["ticket"]["additional_tags"] = tags
+    response = zendesk_request("PUT", f"/api/v2/tickets/{ticket_id}.json", json=payload)
+    return response.status_code in (200, 201)
+

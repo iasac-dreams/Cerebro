@@ -2128,6 +2128,58 @@ def task_report_handler(body: dict):
     return jsonify({"status": "reported", "run_id": run_id})
 
 
+def resolve_message_content(message: dict) -> str:
+    recipient = message.get("recipient") or {}
+    snapshot = recipient.get("template_snapshot") or message.get("template_snapshot") or {}
+    if snapshot.get("body"):
+        parts = []
+        if snapshot.get("header"):
+            parts.append(snapshot["header"])
+        parts.append(snapshot["body"])
+        if snapshot.get("footer"):
+            parts.append(snapshot["footer"])
+        return "\n\n".join(parts)
+
+    template_name = message.get("template_name") or recipient.get("template_name")
+    if template_name:
+        try:
+            for lang in ("es", "es_LA", "es_ES", "en"):
+                key = doc_id(template_name, lang)
+                snap = db().collection(TEMPLATES).document(key).get()
+                if snap.exists:
+                    td = snap.to_dict() or {}
+                    body_text = td.get("body_text") or ""
+                    sunshine = message.get("sunshine_payload") or {}
+                    msg_obj = sunshine.get("message") or {}
+                    tpl_obj = msg_obj.get("template") or {}
+                    values = []
+                    for comp in tpl_obj.get("components") or []:
+                        if str(comp.get("type", "")).lower() == "body":
+                            for param in comp.get("parameters") or []:
+                                if isinstance(param, dict) and param.get("type") == "text":
+                                    values.append(str(param.get("text") or ""))
+                    if body_text:
+                        rendered = body_text
+                        for idx, val in enumerate(values, start=1):
+                            rendered = re.sub(r"\{\{\s*" + str(idx) + r"\s*\}\}", val, rendered)
+                        parts = []
+                        if td.get("header_text"):
+                            parts.append(td["header_text"])
+                        parts.append(rendered)
+                        if td.get("footer_text"):
+                            parts.append(td["footer_text"])
+                        return "\n\n".join(parts)
+        except Exception as e:
+            logger.warning("Error resolving template content: %s", e)
+
+    sunshine = message.get("sunshine_payload") or {}
+    msg_obj = sunshine.get("message") or {}
+    if msg_obj.get("text"):
+        return str(msg_obj["text"])
+
+    return "WhatsApp entregado al destinatario."
+
+
 def task_zendesk_handler(body: dict):
     message_id = str(body.get("message_id") or "")
     message_ref = db().collection(MESSAGES).document(message_id)
@@ -2138,6 +2190,49 @@ def task_zendesk_handler(body: dict):
     if message.get("ticket_id"):
         return jsonify({"ticket_id": message["ticket_id"], "duplicate_task": True})
 
+    message_content = resolve_message_content(message)
+    campaign_name = (message.get("campaign") or {}).get("campaign_name") or message.get("campaign_id") or "WhatsApp"
+    comment_body = (
+        f"WhatsApp entregado al usuario:\n\n"
+        f"{message_content}\n\n"
+        f"----------------------------------------\n"
+        f"Campaña: {campaign_name}\n"
+        f"Run: {message.get('run_id') or 'N/A'}\n"
+        f"Notification ID: {message.get('notification_id') or 'N/A'}"
+    )
+
+    # 1. Verificar si el mensaje proviene de un disparador con ticket_id existente
+    sunshine_payload = message.get("sunshine_payload") or {}
+    metadata = sunshine_payload.get("metadata") if isinstance(sunshine_payload.get("metadata"), dict) else {}
+    if not metadata and isinstance(message.get("metadata"), dict):
+        metadata = message.get("metadata") or {}
+    origin_ticket_id = metadata.get("ticket_id") or metadata.get("ticketId")
+    if not origin_ticket_id and str(message.get("source_reference") or "").isdigit():
+        origin_ticket_id = message.get("source_reference")
+
+    if origin_ticket_id:
+        try:
+            update_payload = {
+                "ticket": {
+                    "comment": {
+                        "body": comment_body,
+                        "public": False,
+                    },
+                    "additional_tags": ["cerebro_sunshine", "sin_disparo_whatsapp"],
+                }
+            }
+            update_resp = zendesk_request("PUT", f"/api/v2/tickets/{origin_ticket_id}.json", json=update_payload)
+            if update_resp.status_code in (200, 201):
+                tid = int(origin_ticket_id)
+                message_ref.set({"ticket_id": tid, "ticket_updated_at": firestore.SERVER_TIMESTAMP, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
+                message["ticket_id"] = tid
+                ev_id = emit_event(message, "zendesk_ticket_updated", {"ticket_id": tid})
+                enqueue_callback(message, ev_id, "zendesk_ticket_updated", {"ticket_id": tid})
+                return jsonify({"ticket_id": tid, "updated": True})
+        except Exception as e:
+            logger.warning("No se pudo actualizar ticket origen %s, se creará uno nuevo: %s", origin_ticket_id, e)
+
+    # 2. Si no viene ticket_id previo, crear un nuevo ticket resuelto para trazabilidad
     recipient = message.get("recipient") or {}
     external_id = f"cerebro-{message_id}"
     try:
@@ -2167,13 +2262,7 @@ def task_zendesk_handler(body: dict):
             "requester_id": requester_id,
             "subject": format_subject(cfg.get("subject"), message),
             "comment": {
-                "body": (
-                    f"WhatsApp entregado al usuario.\n"
-                    f"Campaña: {message.get('campaign_id')}\n"
-                    f"Run: {message.get('run_id')}\n"
-                    f"Plantilla: {message.get('template_name')}\n"
-                    f"Notification ID: {message.get('notification_id')}"
-                ),
+                "body": comment_body,
                 "public": False,
             },
             "tags": sorted(set(tags)),
