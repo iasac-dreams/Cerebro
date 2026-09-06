@@ -17,6 +17,7 @@ import logging
 import os
 import random
 import re
+import threading
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -93,6 +94,7 @@ SUNSHINE_API_ROOT = os.getenv("SUNSHINE_API_ROOT", "https://api.smooch.io").rstr
 SUNSHINE_APP_ID = os.getenv("SUNSHINE_APP_ID", "")
 SUNSHINE_KEY_ID = os.getenv("SUNSHINE_KEY_ID", "")
 SUNSHINE_SECRET_KEY = os.getenv("SUNSHINE_SECRET_KEY", "")
+SUNSHINE_WEBHOOK_SECRET = os.getenv("SUNSHINE_WEBHOOK_SECRET", "")
 SUNSHINE_INTEGRATION_ID = os.getenv("SUNSHINE_INTEGRATION_ID", "")
 SUNSHINE_NAMESPACE = os.getenv("SUNSHINE_TEMPLATE_NAMESPACE", "")
 SUNSHINE_JSON_LIMIT = int(os.getenv("SUNSHINE_JSON_LIMIT_BYTES", "95000"))
@@ -558,6 +560,141 @@ def sync_templates(after: str = "") -> dict:
             f"templates-page-{int(time.time()) // 7200}-{next_cursor}",
         )
     return {"templates": len(templates), "next_page_queued": bool(next_cursor)}
+
+
+SUNSHINE_WEBHOOK_TRIGGERS = [
+    "notification:delivery:channel",
+    "notification:delivery:user",
+    "notification:delivery:failure",
+    "notification:match:failure",
+    "message:delivery:channel",
+    "message:delivery:user",
+    "message:delivery:failure",
+]
+_sunshine_webhook_ready = False
+_sunshine_webhook_secret = ""
+_sunshine_webhook_setup_started = False
+_sunshine_webhook_setup_lock = threading.Lock()
+
+
+def _store_webhook_secret(secret_val: str):
+    if not secret_val:
+        return
+    try:
+        db().collection(CONFIG).document("sunshine_webhook").set({
+            "secret": secret_val,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+    except Exception as err:
+        logger.warning("Could not persist webhook secret to firestore: %s", err)
+
+
+def _register_sunshine_webhook(app_id: str, key_id: str, secret_key: str):
+    global _sunshine_webhook_ready, _sunshine_webhook_secret, _sunshine_webhook_setup_started
+    if not (app_id and key_id and secret_key):
+        return
+    gateway_url = os.getenv("GATEWAY_PUBLIC_URL") or os.getenv("GATEWAY_SERVICE_URL") or "https://cerebro-gateway-462948619262.southamerica-west1.run.app"
+    target = (os.getenv("SUNSHINE_WEBHOOK_TARGET") or f"{gateway_url.rstrip('/')}/webhooks/sunshine").rstrip("/")
+    url = f"{SUNSHINE_API_ROOT}/v1.1/apps/{app_id}/webhooks"
+    desired = set(SUNSHINE_WEBHOOK_TRIGGERS)
+    try:
+        session = http_session()
+        response = session.get(url, auth=(key_id, secret_key), timeout=15)
+        if response.status_code != 200:
+            logger.warning("[SUNSHINE WEBHOOK] GET webhooks returned %s: %s", response.status_code, response.text[:500])
+            return
+        webhooks = response.json().get("webhooks", [])
+        existing = next((item for item in webhooks if str(item.get("target", "")).rstrip("/") == target), None)
+        body = {
+            "target": target,
+            "triggers": SUNSHINE_WEBHOOK_TRIGGERS,
+            "includeFullAppUser": False,
+        }
+        if existing and desired.issubset(set(existing.get("triggers") or [])):
+            _sunshine_webhook_secret = existing.get("secret") or _sunshine_webhook_secret
+            _sunshine_webhook_ready = True
+            logger.info("[SUNSHINE WEBHOOK ACTIVE] id=%s target=%s", existing.get("_id"), target)
+            _store_webhook_secret(_sunshine_webhook_secret)
+            return
+        if existing:
+            response = session.put(f"{url}/{existing['_id']}", auth=(key_id, secret_key), json=body, timeout=15)
+        else:
+            response = session.post(url, auth=(key_id, secret_key), json=body, timeout=15)
+        if response.status_code not in (200, 201):
+            logger.warning("[SUNSHINE WEBHOOK] Save webhook returned %s: %s", response.status_code, response.text[:500])
+            return
+        saved = response.json().get("webhook", {})
+        _sunshine_webhook_secret = saved.get("secret") or _sunshine_webhook_secret
+        _sunshine_webhook_ready = True
+        logger.info("[SUNSHINE WEBHOOK REGISTERED] id=%s target=%s", saved.get("_id"), target)
+        _store_webhook_secret(_sunshine_webhook_secret)
+    except Exception as exc:
+        logger.warning("[SUNSHINE WEBHOOK SETUP ERROR] %s", exc)
+    finally:
+        if not _sunshine_webhook_ready:
+            with _sunshine_webhook_setup_lock:
+                _sunshine_webhook_setup_started = False
+
+
+def ensure_sunshine_webhook(app_id: str | None = None, key_id: str | None = None, secret_key: str | None = None):
+    global _sunshine_webhook_setup_started
+    app_id = app_id or SUNSHINE_APP_ID
+    key_id = key_id or SUNSHINE_KEY_ID
+    secret_key = secret_key or SUNSHINE_SECRET_KEY
+    if not (app_id and key_id and secret_key):
+        return
+    if _sunshine_webhook_ready or _sunshine_webhook_setup_started:
+        return
+    with _sunshine_webhook_setup_lock:
+        if _sunshine_webhook_ready or _sunshine_webhook_setup_started:
+            return
+        _sunshine_webhook_setup_started = True
+        threading.Thread(
+            target=_register_sunshine_webhook,
+            args=(app_id, key_id, secret_key),
+            daemon=True,
+        ).start()
+
+
+def sunshine_webhook_authorized(received: str) -> bool:
+    global _sunshine_webhook_secret
+    if not received:
+        return False
+    configured = SUNSHINE_WEBHOOK_SECRET or os.getenv("SUNSHINE_WEBHOOK_TOKEN")
+    if configured and hmac.compare_digest(configured, received):
+        return True
+    if _sunshine_webhook_secret and hmac.compare_digest(_sunshine_webhook_secret, received):
+        return True
+    try:
+        doc = db().collection(CONFIG).document("sunshine_webhook").get()
+        if doc.exists:
+            stored = doc.to_dict().get("secret")
+            if stored:
+                _sunshine_webhook_secret = stored
+                if hmac.compare_digest(stored, received):
+                    return True
+    except Exception:
+        pass
+    app_id = SUNSHINE_APP_ID
+    key_id = SUNSHINE_KEY_ID
+    secret_key = SUNSHINE_SECRET_KEY
+    if not (app_id and key_id and secret_key):
+        return False
+    try:
+        gateway_url = os.getenv("GATEWAY_PUBLIC_URL") or os.getenv("GATEWAY_SERVICE_URL") or "https://cerebro-gateway-462948619262.southamerica-west1.run.app"
+        target = (os.getenv("SUNSHINE_WEBHOOK_TARGET") or f"{gateway_url.rstrip('/')}/webhooks/sunshine").rstrip("/")
+        session = http_session()
+        response = session.get(f"{SUNSHINE_API_ROOT}/v1.1/apps/{app_id}/webhooks", auth=(key_id, secret_key), timeout=15)
+        if response.status_code == 200:
+            webhooks = response.json().get("webhooks", [])
+            webhook = next((item for item in webhooks if str(item.get("target", "")).rstrip("/") == target), None)
+            if webhook and webhook.get("secret"):
+                _sunshine_webhook_secret = webhook["secret"]
+                _store_webhook_secret(_sunshine_webhook_secret)
+                return hmac.compare_digest(_sunshine_webhook_secret, received)
+    except Exception as exc:
+        logger.warning("[SUNSHINE WEBHOOK AUTH EXCEPTION] %s", exc)
+    return False
 
 
 def sync_meta_templates(after: str = "") -> dict:
@@ -1624,6 +1761,7 @@ def get_whatsapp_analytics(days: int = 30) -> dict:
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = CORE_MAX_BODY_BYTES
+    ensure_sunshine_webhook()
 
     @app.after_request
     def security_headers(response):
@@ -1802,9 +1940,17 @@ def create_app() -> Flask:
         except KeyError:
             return jsonify({"error": "run_not_found"}), 404
 
-    @app.post("/internal/ingress/webhooks/sunshine")
+    @app.route("/internal/ingress/webhooks/sunshine", methods=["GET", "POST", "HEAD"])
     @require_gateway
     def ingress_sunshine_webhook():
+        if request.method == "HEAD":
+            return "", 200
+        if request.method == "GET":
+            return jsonify({"status": "ready"}), 200
+        secret_header = request.headers.get("X-API-Key") or request.headers.get("X-Sunshine-Secret") or ""
+        if secret_header and not sunshine_webhook_authorized(secret_header):
+            logger.warning("[SUNSHINE WEBHOOK] Unauthorized request rejected.")
+            return jsonify({"error": "webhook_unauthorized"}), 401
         body = request.get_json(silent=True)
         if not isinstance(body, dict):
             return jsonify({"error": "json_object_required"}), 400
@@ -1996,6 +2142,10 @@ def create_app() -> Flask:
 # =====================================================================
 @require_task(SUNSHINE_QUEUE)
 def task_sunshine():
+    try:
+        ensure_sunshine_webhook()
+    except (NameError, Exception):
+        pass
     body = request.get_json(silent=True) or {}
     if body.get("kind") == "sync_templates":
         try:
@@ -2136,6 +2286,9 @@ def task_event_handler(body: dict):
         "notification:delivery:user": "user_delivered",
         "notification:delivery:failure": "failed",
         "notification:match:failure": "failed",
+        "message:delivery:channel": "channel_delivered",
+        "message:delivery:user": "user_delivered",
+        "message:delivery:failure": "failed",
     }
     status = status_map.get(trigger)
     if not status:
@@ -2384,7 +2537,7 @@ def task_analytics_handler(body: dict):
         "template_name": event.get("template_name"),
         "status": event.get("status"),
         "event_at": serialize(event.get("event_at") or utcnow()),
-        "details_json": serialize(event.get("details") or {}),
+        "details_json": json.dumps(serialize(event.get("details") or {})),
     }
     if bq_client() is not None:
         try:

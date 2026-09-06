@@ -113,6 +113,9 @@ def handle_event_task(body: dict):
         "notification:delivery:user": "user_delivered",
         "notification:delivery:failure": "failed",
         "notification:match:failure": "failed",
+        "message:delivery:channel": "channel_delivered",
+        "message:delivery:user": "user_delivered",
+        "message:delivery:failure": "failed",
     }
     status = status_map.get(trigger)
     if not status:

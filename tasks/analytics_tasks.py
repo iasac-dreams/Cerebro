@@ -1,6 +1,7 @@
 """BigQuery pseudonymized analytics worker."""
 from __future__ import annotations
 
+import json
 import logging
 from flask import jsonify
 from google.cloud import firestore
@@ -25,7 +26,7 @@ def handle_analytics_task(body: dict):
         "template_name": event.get("template_name"),
         "status": event.get("status"),
         "event_at": config.serialize(event.get("event_at") or config.utcnow()),
-        "details_json": config.serialize(event.get("details") or {}),
+        "details_json": json.dumps(config.serialize(event.get("details") or {})),
     }
     if bq_client() is not None:
         try:

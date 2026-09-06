@@ -10,6 +10,7 @@ from security.decorators import require_gateway
 from services.message_service import sanitize_legacy_payload, store_message
 from services.batch_service import save_incoming_batch
 from services.reporting_service import run_report, schedule_report
+from clients.sunshine import sunshine_webhook_authorized
 
 ingress_bp = Blueprint("ingress", __name__)
 
@@ -184,9 +185,16 @@ def ingress_report(run_id: str):
         return jsonify({"error": "run_not_found"}), 404
 
 
-@ingress_bp.post("/webhooks/sunshine")
+@ingress_bp.route("/webhooks/sunshine", methods=["GET", "POST", "HEAD"])
 @require_gateway
 def ingress_sunshine_webhook():
+    if request.method == "HEAD":
+        return "", 200
+    if request.method == "GET":
+        return jsonify({"status": "ready"}), 200
+    secret_header = request.headers.get("X-API-Key") or request.headers.get("X-Sunshine-Secret") or ""
+    if secret_header and not sunshine_webhook_authorized(secret_header):
+        return jsonify({"error": "webhook_unauthorized"}), 401
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify({"error": "json_object_required"}), 400
